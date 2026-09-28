@@ -1,0 +1,22 @@
+CREATE TABLE activity_logs (
+    id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id      BIGINT UNSIGNED NOT NULL,
+    role         VARCHAR(60) NOT NULL DEFAULT '',
+    branch_id    BIGINT UNSIGNED NULL,
+    module       VARCHAR(60) NOT NULL,
+    action       VARCHAR(60) NOT NULL,
+    entity_type  VARCHAR(60) NOT NULL,
+    entity_id    BIGINT UNSIGNED NULL,
+    before_json  JSON NULL,
+    after_json   JSON NULL,
+    ip           VARCHAR(64) NOT NULL DEFAULT '',
+    device       VARCHAR(120) NOT NULL DEFAULT '',
+    created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_activity_logs_user_id (user_id),
+    KEY idx_activity_logs_branch_id (branch_id),
+    KEY idx_activity_logs_module (module),
+    KEY idx_activity_logs_entity_type (entity_type),
+    KEY idx_activity_logs_created_at (created_at),
+    CONSTRAINT fk_activity_logs_user FOREIGN KEY (user_id) REFERENCES users (id),
+    CONSTRAINT fk_activity_logs_branch FOREIGN KEY (branch_id) REFERENCES branches (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

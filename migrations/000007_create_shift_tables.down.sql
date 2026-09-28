@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS cash_movements;
+DROP TABLE IF EXISTS shift_counts;
+DROP TABLE IF EXISTS shifts;
