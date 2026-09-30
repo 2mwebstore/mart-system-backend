@@ -787,6 +787,12 @@ func readImportCSV(c *gin.Context) ([][]string, error) {
 func csvHeaderIndex(header []string) map[string]int {
 	idx := make(map[string]int, len(header))
 	for i, h := range header {
+		// A UTF-8 BOM (Excel/Numbers/Sheets often add one, especially once a
+		// file has non-ASCII text like Khmer) lands on the very first cell —
+		// TrimSpace doesn't strip it, since it isn't whitespace, so the
+		// first column's header would otherwise never match anything and
+		// every row would look like that column is missing.
+		h = strings.TrimPrefix(h, "\ufeff")
 		idx[strings.ToLower(strings.TrimSpace(h))] = i
 	}
 	return idx
