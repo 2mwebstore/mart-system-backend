@@ -14,33 +14,66 @@ type Category struct {
 func (Category) TableName() string { return "categories" }
 
 type Supplier struct {
-	ID            uint64 `gorm:"primaryKey" json:"id"`
-	Name          string `gorm:"size:150;not null" json:"name"`
-	Phone         string `gorm:"size:30" json:"phone"`
-	Contact       string `gorm:"size:150" json:"contact"`
-	PaymentTerms  string `gorm:"size:150" json:"payment_terms"`
+	ID           uint64 `gorm:"primaryKey" json:"id"`
+	Name         string `gorm:"size:150;not null" json:"name"`
+	Phone        string `gorm:"size:30" json:"phone"`
+	Contact      string `gorm:"size:150" json:"contact"`
+	PaymentTerms string `gorm:"size:150" json:"payment_terms"`
 	Timestamps
 	SoftDelete
 }
 
 func (Supplier) TableName() string { return "suppliers" }
 
+// ProductType: STANDARD is a physical item — stock-tracked, can run out.
+// SERVICE is not stocked at all — a fee, a delivery charge, an install job —
+// always sellable and never appears in a stock report or reorder count. See
+// docs/DECISIONS.md for where each is skipped in the sale/stock code path.
+type ProductType string
+
+const (
+	ProductStandard ProductType = "STANDARD"
+	ProductService  ProductType = "SERVICE"
+)
+
+// A variant (ParentProductID set) is a full Product row in its own right —
+// its own id, SKU, barcode, price history and branch_stock — so every sale,
+// purchase order, stock movement and report that already works on a
+// product_id keeps working on a variant with no changes at all. Only
+// CategoryID/SupplierID/Type/ImageURL are forced to always match the
+// parent's (enforced in CreateProduct/UpdateProduct, not at the DB level);
+// SKU/barcode/name/price/cost/stock are genuinely independent per variant.
+// A variant's own ParentProductID must be nil — one level of nesting only.
+// See docs/DECISIONS.md for why this shape was chosen over a separate
+// variants table.
 type Product struct {
-	ID         uint64  `gorm:"primaryKey" json:"id"`
-	SKU        string  `gorm:"size:60;not null;uniqueIndex" json:"sku"`
-	Barcode    *string `gorm:"size:60;index" json:"barcode,omitempty"`
-	NameEn     string  `gorm:"size:150;not null" json:"name_en"`
-	NameKm     string  `gorm:"size:150" json:"name_km"`
-	CategoryID *uint64 `gorm:"index" json:"category_id,omitempty"`
-	SupplierID *uint64 `gorm:"index" json:"supplier_id,omitempty"`
-	Unit       string  `gorm:"size:30;not null;default:'pcs'" json:"unit"`
-	ImageURL   string  `gorm:"type:mediumtext" json:"image_url"`
-	Active     bool    `gorm:"not null" json:"active"` // see note on models.Branch.Active
+	ID              uint64      `gorm:"primaryKey" json:"id"`
+	ParentProductID *uint64     `gorm:"index" json:"parent_product_id,omitempty"`
+	SKU             string      `gorm:"size:60;not null;uniqueIndex" json:"sku"`
+	Barcode         *string     `gorm:"size:60;index" json:"barcode,omitempty"`
+	NameEn          string      `gorm:"size:150;not null" json:"name_en"`
+	NameKm          string      `gorm:"size:150" json:"name_km"`
+	VariantName     string      `gorm:"size:100;not null;default:''" json:"variant_name"`
+	CategoryID      *uint64     `gorm:"index" json:"category_id,omitempty"`
+	SupplierID      *uint64     `gorm:"index" json:"supplier_id,omitempty"`
+	Unit            string      `gorm:"size:30;not null;default:'pcs'" json:"unit"`
+	Type            ProductType `gorm:"column:product_type;size:20;not null;default:'STANDARD';index" json:"product_type"`
+	ImageURL        string      `gorm:"type:mediumtext" json:"image_url"`
+	Active          bool        `gorm:"not null" json:"active"` // see note on models.Branch.Active
+	// STANDARD-only (meaningless for SERVICE, which is never stocked and
+	// always sellable regardless): removes the product from the POS grid
+	// once stock hits zero, rather than just greying its tile out.
+	// Independent per variant, like ReorderPoint — never inherited from a
+	// parent. Whether a sale can still go through at zero stock is a
+	// store-wide setting instead (settingsDTO.AllowOutOfStockSale in
+	// reference.go), not a per-product column — see docs/DECISIONS.md.
+	HideWhenOutOfStock bool `gorm:"not null;default:false" json:"hide_when_out_of_stock"`
 	Timestamps
 	SoftDelete
 
-	Category *Category `gorm:"foreignKey:CategoryID" json:"category,omitempty"`
-	Supplier *Supplier `gorm:"foreignKey:SupplierID" json:"supplier,omitempty"`
+	Category      *Category `gorm:"foreignKey:CategoryID" json:"category,omitempty"`
+	Supplier      *Supplier `gorm:"foreignKey:SupplierID" json:"supplier,omitempty"`
+	ParentProduct *Product  `gorm:"foreignKey:ParentProductID" json:"-"`
 }
 
 func (Product) TableName() string { return "products" }

@@ -155,6 +155,7 @@ func seedRolesAndPermissions(db *gorm.DB) map[string]models.Role {
 		{Key: "pos.sell", Group: "pos", Description: "Sell at the till"},
 		{Key: "pos.discount", Group: "pos", Description: "Apply a discount"},
 		{Key: "pos.void", Group: "pos", Description: "Void a sale"},
+		{Key: "pos.edit_sale", Group: "pos", Description: "Edit a sale's items (still-open shift only)"},
 		{Key: "pos.refund", Group: "pos", Description: "Refund a sale"},
 		{Key: "pos.open_drawer", Group: "pos", Description: "Open the cash drawer without a sale"},
 		{Key: "shift.own", Group: "shift", Description: "Open/close own shift"},
@@ -164,6 +165,13 @@ func seedRolesAndPermissions(db *gorm.DB) map[string]models.Role {
 		{Key: "inventory.receive", Group: "inventory", Description: "Receive stock"},
 		{Key: "inventory.adjust", Group: "inventory", Description: "Adjust/write off/count stock"},
 		{Key: "inventory.edit_price", Group: "inventory", Description: "Edit product price/cost"},
+		// Split out from the general inventory.adjust/inventory.edit_price
+		// catalog-write gate so a role can be allowed to add products but
+		// not change existing ones, or vice versa — categories and suppliers
+		// still just use inventory.adjust/inventory.edit_price (see
+		// routes.go's catalogWrite).
+		{Key: "inventory.product_create", Group: "inventory", Description: "Create new products (and add variants)"},
+		{Key: "inventory.product_edit", Group: "inventory", Description: "Edit or delete existing products"},
 		{Key: "inventory.purchase_order", Group: "inventory", Description: "Manage purchase orders"},
 		{Key: "inventory.transfer", Group: "inventory", Description: "Transfer stock between branches"},
 		{Key: "report.sales", Group: "report", Description: "View sales reports"},
@@ -177,6 +185,12 @@ func seedRolesAndPermissions(db *gorm.DB) map[string]models.Role {
 		{Key: "settings.rate", Group: "user", Description: "Change the exchange rate"},
 		{Key: "branch.manage", Group: "user", Description: "Manage branches"},
 		{Key: "expense.manage", Group: "user", Description: "Manage expenses"},
+		{Key: "system.manage", Group: "user", Description: "Manage Telegram alerts and database backups"},
+		// Deliberately not part of any grouped permission set below (posAll,
+		// inventoryOps, etc.) — only allKeys (the Owner role) grants it, so
+		// enabling something else for a Manager can never accidentally also
+		// hand them a full data wipe. See ResetForProduction's doc comment.
+		{Key: "system.reset", Group: "user", Description: "Wipe all data for a fresh production setup"},
 	}
 
 	permsByKey := make(map[string]models.Permission, len(permissionDefs))
@@ -200,9 +214,12 @@ func seedRolesAndPermissions(db *gorm.DB) map[string]models.Role {
 		allKeys = append(allKeys, p.Key)
 	}
 
-	posAll := []string{"pos.sell", "pos.discount", "pos.void", "pos.refund", "pos.open_drawer"}
+	posAll := []string{"pos.sell", "pos.discount", "pos.void", "pos.edit_sale", "pos.refund", "pos.open_drawer"}
 	shiftAll := []string{"shift.own", "shift.close_others", "shift.see_expected"}
-	inventoryOps := []string{"inventory.view", "inventory.receive", "inventory.adjust", "inventory.purchase_order", "inventory.transfer"}
+	inventoryOps := []string{
+		"inventory.view", "inventory.receive", "inventory.adjust", "inventory.product_create", "inventory.product_edit",
+		"inventory.purchase_order", "inventory.transfer",
+	}
 	reportAll := []string{"report.sales", "report.profit_loss", "report.export", "report.activity_log"}
 
 	defs := []roleDef{

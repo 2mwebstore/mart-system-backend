@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/caarlos0/env/v10"
@@ -23,10 +24,10 @@ type Config struct {
 	DBUser     string `env:"DB_USER" envDefault:"com_mart"`
 	DBPassword string `env:"DB_PASSWORD"`
 
-	JWTAccessSecret      string `env:"JWT_ACCESS_SECRET,required"`
-	JWTRefreshSecret     string `env:"JWT_REFRESH_SECRET,required"`
-	JWTAccessTTLMinutes  int    `env:"JWT_ACCESS_TTL_MINUTES" envDefault:"15"`
-	JWTRefreshTTLDays    int    `env:"JWT_REFRESH_TTL_DAYS" envDefault:"7"`
+	JWTAccessSecret     string `env:"JWT_ACCESS_SECRET,required"`
+	JWTRefreshSecret    string `env:"JWT_REFRESH_SECRET,required"`
+	JWTAccessTTLMinutes int    `env:"JWT_ACCESS_TTL_MINUTES" envDefault:"15"`
+	JWTRefreshTTLDays   int    `env:"JWT_REFRESH_TTL_DAYS" envDefault:"7"`
 
 	LoginMaxAttempts    int `env:"LOGIN_MAX_ATTEMPTS" envDefault:"5"`
 	LoginLockoutMinutes int `env:"LOGIN_LOCKOUT_MINUTES" envDefault:"5"`
@@ -42,6 +43,14 @@ type Config struct {
 	KHQRProvider   string `env:"KHQR_PROVIDER" envDefault:"mock"`
 	KHQRAPIKey     string `env:"KHQR_API_KEY"`
 	KHQRMerchantID string `env:"KHQR_MERCHANT_ID"`
+
+	// BackupDir is where nightly/manual mysqldump files are written. On a
+	// host with no persistent volume (e.g. a plain Railway service) this
+	// resets on every deploy — see docs/DEPLOY.md. MysqldumpPath overrides
+	// the binary name/path when `mysqldump` isn't on PATH (some local MAMP
+	// installs only ship it inside the MAMP bundle).
+	BackupDir     string `env:"BACKUP_DIR" envDefault:"./backups"`
+	MysqldumpPath string `env:"MYSQLDUMP_PATH" envDefault:"mysqldump"`
 }
 
 // Load reads a .env file if present (dev convenience) then parses the
@@ -53,6 +62,13 @@ func Load() (*Config, error) {
 	cfg := &Config{}
 	if err := env.Parse(cfg); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
+	}
+	// PaaS hosts (Railway, Heroku, ...) hand the app its port as $PORT; an
+	// explicit APP_PORT still wins.
+	if os.Getenv("APP_PORT") == "" {
+		if p := os.Getenv("PORT"); p != "" {
+			cfg.AppPort = p
+		}
 	}
 	return cfg, nil
 }

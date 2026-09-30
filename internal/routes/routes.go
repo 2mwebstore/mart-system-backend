@@ -59,6 +59,10 @@ func Setup(deps Dependencies) *gin.Engine {
 		perm := middleware.RequirePermission
 		anyPerm := middleware.RequireAnyPermission
 		catalogWrite := anyPerm("inventory.adjust", "inventory.edit_price")
+		// Products get their own create/edit split (categories and
+		// suppliers keep the general catalogWrite gate above).
+		productCreate := perm("inventory.product_create")
+		productEdit := perm("inventory.product_edit")
 
 		// Reference data & settings
 		authed.GET("/branches", api.ListBranches)
@@ -81,11 +85,34 @@ func Setup(deps Dependencies) *gin.Engine {
 		authed.GET("/exchange-rate", api.GetExchangeRate)
 		authed.POST("/exchange-rate", perm("settings.rate"), api.SetExchangeRate)
 
+		// Telegram alerts & database backups (Settings > Alerts & Backup) —
+		// Owner-only by default, same standing as branch.manage.
+		system := perm("system.manage")
+		authed.GET("/settings/notifications", system, api.GetNotifySettings)
+		authed.PUT("/settings/notifications", system, api.UpdateNotifySettings)
+		authed.POST("/settings/notifications/test", system, api.SendTestAlert)
+		authed.GET("/backups", system, api.ListBackups)
+		authed.PUT("/backups/settings", system, api.UpdateBackupSettings)
+		authed.POST("/backups/run", system, api.RunBackupNow)
+		authed.GET("/backups/:id/download", system, api.DownloadBackup)
+		authed.DELETE("/backups/:id", system, api.DeleteBackup)
+		authed.GET("/settings/numbering", system, api.GetNumberSequences)
+		authed.PUT("/settings/numbering", system, api.UpdateNumberSequence)
+		authed.GET("/settings/activity-log-retention", system, api.GetActivityLogRetention)
+		authed.PUT("/settings/activity-log-retention", system, api.UpdateActivityLogRetention)
+		authed.POST("/settings/activity-log-retention/clear", system, api.ClearActivityLogNow)
+		authed.PUT("/settings/stock-policy", system, api.UpdateStockPolicy)
+
+		// Its own permission, deliberately separate from system.manage — see
+		// system_reset.go's doc comment.
+		authed.POST("/system/reset-for-production", perm("system.reset"), api.ResetForProduction)
+
 		// Catalog
 		authed.GET("/categories", perm("inventory.view"), api.ListCategories)
 		authed.POST("/categories", catalogWrite, api.CreateCategory)
 		authed.PUT("/categories/:id", catalogWrite, api.UpdateCategory)
 		authed.DELETE("/categories/:id", catalogWrite, api.DeleteCategory)
+		authed.POST("/categories/import", catalogWrite, api.ImportCategories)
 
 		authed.GET("/suppliers", perm("inventory.view"), api.ListSuppliers)
 		authed.POST("/suppliers", catalogWrite, api.CreateSupplier)
@@ -93,9 +120,10 @@ func Setup(deps Dependencies) *gin.Engine {
 		authed.DELETE("/suppliers/:id", catalogWrite, api.DeleteSupplier)
 
 		authed.GET("/products", perm("inventory.view"), api.ListProducts)
-		authed.POST("/products", catalogWrite, api.CreateProduct)
-		authed.PUT("/products/:id", catalogWrite, api.UpdateProduct)
-		authed.DELETE("/products/:id", catalogWrite, api.DeleteProduct)
+		authed.POST("/products", productCreate, api.CreateProduct)
+		authed.PUT("/products/:id", productEdit, api.UpdateProduct)
+		authed.DELETE("/products/:id", productEdit, api.DeleteProduct)
+		authed.POST("/products/import", productCreate, api.ImportProducts)
 
 		authed.GET("/stock-movements", perm("inventory.view"), api.ListStockMovements)
 
@@ -119,6 +147,7 @@ func Setup(deps Dependencies) *gin.Engine {
 		authed.GET("/users", anyPerm("user.manage", "role.manage"), api.ListUsers)
 		authed.POST("/users", perm("user.manage"), api.CreateUser)
 		authed.PUT("/users/:id", perm("user.manage"), api.UpdateUser)
+		authed.DELETE("/users/:id", perm("user.manage"), api.DeleteUser)
 		authed.POST("/users/:id/reset-pin", perm("user.manage"), api.ResetUserPIN)
 		authed.GET("/roles", anyPerm("user.manage", "role.manage"), api.ListRoles)
 		authed.GET("/permissions", anyPerm("user.manage", "role.manage"), api.ListPermissions)
@@ -134,7 +163,9 @@ func Setup(deps Dependencies) *gin.Engine {
 		authed.GET("/shifts", anyPerm("shift.own", "report.sales"), api.ListShifts)
 
 		authed.GET("/sales", anyPerm("pos.sell", "report.sales"), api.ListSales)
+		authed.GET("/sales/:id", anyPerm("pos.sell", "report.sales"), api.GetSale)
 		authed.POST("/sales", perm("pos.sell"), api.CreateSale)
+		authed.PUT("/sales/:id", perm("pos.edit_sale"), api.EditSale)
 		authed.POST("/sales/:id/void", perm("pos.void"), api.VoidSale)
 
 		// Reports

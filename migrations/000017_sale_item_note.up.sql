@@ -1,0 +1,1 @@
+ALTER TABLE sale_items ADD COLUMN note VARCHAR(255) NOT NULL DEFAULT '' AFTER discount_cents;

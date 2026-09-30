@@ -11,6 +11,7 @@ import (
 
 	"com-mart/backend/internal/middleware"
 	"com-mart/backend/internal/models"
+	"com-mart/backend/internal/services"
 	"com-mart/backend/internal/utils"
 )
 
@@ -43,9 +44,11 @@ func (a *API) poSelect() *gorm.DB {
 		Joins("LEFT JOIN suppliers s ON s.id = po.supplier_id")
 }
 
-const poColumns = "po.id, po.branch_id, po.supplier_id, COALESCE(s.name,'') AS supplier_name, po.status, po.note, po.shipping_cents, DATE_FORMAT(po.created_at,'%Y-%m-%d') AS created_at"
+const poColumns = "po.id, po.code, po.branch_id, po.supplier_id, COALESCE(s.name,'') AS supplier_name, po.status, po.note, po.shipping_cents, DATE_FORMAT(po.created_at,'%Y-%m-%d') AS created_at"
 
-// attachPOItems fills Code and Items on a set of PO headers.
+// attachPOItems fills Items on a set of PO headers (Code already comes from
+// poColumns — see the migration 000015 note on why it's a real stored column
+// now instead of "PO-<id>" computed on every read).
 func (a *API) attachPOItems(pos []poDTO) error {
 	if len(pos) == 0 {
 		return nil
@@ -55,7 +58,6 @@ func (a *API) attachPOItems(pos []poDTO) error {
 	for i, p := range pos {
 		ids[i] = p.ID
 		idx[p.ID] = i
-		pos[i].Code = fmt.Sprintf("PO-%d", p.ID)
 		pos[i].Items = []poItemDTO{}
 	}
 	type itemRow struct {
@@ -112,8 +114,11 @@ func (a *API) ListPurchaseOrders(c *gin.Context) {
 		}
 	}
 	if search := strings.TrimSpace(c.Query("q")); search != "" {
-		num := strings.TrimPrefix(strings.ToUpper(search), "PO-")
-		base = base.Where("CAST(po.id AS CHAR) = ? OR s.name LIKE ? OR po.note LIKE ?", num, likeArg(search), likeArg(search))
+		// po.code is a real column now (see migration 000015) and its prefix
+		// is admin-configurable, so a plain substring match on it — rather
+		// than stripping a hardcoded "PO-" and matching the numeric id — is
+		// what actually works regardless of what the prefix is set to.
+		base = base.Where("po.code LIKE ? OR s.name LIKE ? OR po.note LIKE ?", likeArg(search), likeArg(search), likeArg(search))
 	}
 	base = base.Session(&gorm.Session{})
 	var total int64
@@ -132,9 +137,33 @@ func (a *API) ListPurchaseOrders(c *gin.Context) {
 	}
 	var summary gin.H
 	if pg.on {
+		// "Open purchase orders" is a page-level KPI on the Inventory screen
+		// (shown above all 5 tabs, unaffected by this table's own filters),
+		// so it's deliberately branch-wide, not scoped to status/supplier/date.
 		var open int64
 		a.DB.Model(&models.PurchaseOrder{}).Where("branch_id = ? AND status NOT IN ('RECEIVED','CANCELLED')", branchID).Count(&open)
-		summary = gin.H{"open_orders": open}
+
+		// The rest respect the request's filters (status/supplier/date) —
+		// used by the Report details "Purchase orders" tab as whole-range
+		// totals above the paged table, same pattern as the other reports.
+		// Field names avoid GORM's acronym-aware snake_case conversion
+		// tripping over "POs" (it doesn't land on "pos") — spell them out.
+		var agg struct {
+			TotalOrders int64
+			Received    int64
+			Shipping    int64
+		}
+		base.Session(&gorm.Session{}).Select("COUNT(*) AS total_orders, COALESCE(SUM(po.status = 'RECEIVED'),0) AS received, COALESCE(SUM(po.shipping_cents),0) AS shipping").Scan(&agg)
+		var itemCost struct{ Total int64 }
+		a.DB.Table("purchase_order_items poi").
+			Select("COALESCE(SUM(poi.qty_ordered * poi.unit_cost_cents), 0) AS total").
+			Where("poi.purchase_order_id IN (?)", base.Session(&gorm.Session{}).Select("po.id")).
+			Scan(&itemCost)
+
+		summary = gin.H{
+			"open_orders": open, "total_orders": agg.TotalOrders, "received_orders": agg.Received,
+			"total_cost_cents": itemCost.Total + agg.Shipping,
+		}
 	}
 	pg.respond(c, pos, total, summary)
 }
@@ -163,6 +192,18 @@ func (a *API) savePO(c *gin.Context, existingID uint64) {
 		fail(c, utils.ErrForbidden)
 		return
 	}
+	// A SERVICE product is never stocked, so it can't be ordered or received —
+	// same reason it can't appear in a stock movement (see CreateSale).
+	ids := make([]uint64, len(req.Items))
+	for i, it := range req.Items {
+		ids[i] = it.ProductID
+	}
+	var serviceCount int64
+	a.DB.Model(&models.Product{}).Where("id IN ? AND product_type = ?", ids, models.ProductService).Count(&serviceCount)
+	if serviceCount > 0 {
+		fail(c, utils.NewAppError(http.StatusUnprocessableEntity, "SERVICE_NOT_STOCKED", "Service products don't hold stock and can't be added to a purchase order."))
+		return
+	}
 	status := req.Status
 	if status == "" {
 		status = string(models.PurchaseOrderDraft)
@@ -170,7 +211,11 @@ func (a *API) savePO(c *gin.Context, existingID uint64) {
 	var poID uint64
 	err := a.DB.Transaction(func(tx *gorm.DB) error {
 		if existingID == 0 {
-			po := models.PurchaseOrder{BranchID: req.BranchID, SupplierID: req.SupplierID, Status: models.PurchaseOrderStatus(status), Note: req.Note, ShippingCents: req.ShippingCents, UserID: middleware.UserIDFrom(c)}
+			code, err := nextDocNumber(tx, DocPurchaseOrder)
+			if err != nil {
+				return err
+			}
+			po := models.PurchaseOrder{Code: code, BranchID: req.BranchID, SupplierID: req.SupplierID, Status: models.PurchaseOrderStatus(status), Note: req.Note, ShippingCents: req.ShippingCents, UserID: middleware.UserIDFrom(c)}
 			if err := tx.Omit("Supplier", "Items").Create(&po).Error; err != nil {
 				return err
 			}
@@ -253,7 +298,7 @@ func (a *API) DeletePurchaseOrder(c *gin.Context) {
 		dbFail(c, err)
 		return
 	}
-	a.audit(c, "inventory", "po.delete", "purchase_order", id, gin.H{"code": fmt.Sprintf("PO-%d", id)}, nil)
+	a.audit(c, "inventory", "po.delete", "purchase_order", id, gin.H{"code": po.Code}, nil)
 	utils.OK(c, http.StatusOK, gin.H{"deleted": true})
 }
 
@@ -267,8 +312,8 @@ func (a *API) ReceivePurchaseOrder(c *gin.Context) {
 		return
 	}
 	userID := middleware.UserIDFrom(c)
+	var po models.PurchaseOrder
 	err := a.DB.Transaction(func(tx *gorm.DB) error {
-		var po models.PurchaseOrder
 		if err := tx.First(&po, id).Error; err != nil {
 			return err
 		}
@@ -311,7 +356,20 @@ func (a *API) ReceivePurchaseOrder(c *gin.Context) {
 		dbFail(c, err)
 		return
 	}
-	a.audit(c, "inventory", "po.receive", "purchase_order", id, nil, gin.H{"code": fmt.Sprintf("PO-%d", id), "status": "RECEIVED"})
+	a.audit(c, "inventory", "po.receive", "purchase_order", id, nil, gin.H{"code": po.Code, "status": "RECEIVED"})
 	out, _ := a.loadPOs(0, id)
+	if len(out) > 0 {
+		po := out[0]
+		total := po.ShippingCents
+		itemLines := make([]string, len(po.Items))
+		for i, it := range po.Items {
+			total += it.QtyOrdered * it.UnitCostCents
+			itemLines[i] = fmt.Sprintf("%d× %s", it.QtyOrdered, services.HTMLEscape(it.ProductName))
+		}
+		a.Notify.Send(services.AlertPOReceived, fmt.Sprintf(
+			"📦 <b>Purchase order received</b>\n%s · %s\n%s\nTotal: %s",
+			po.Code, services.HTMLEscape(po.SupplierName), services.FormatItemLines(itemLines, 12), services.FormatUSD(total),
+		))
+	}
 	utils.OK(c, http.StatusOK, out[0])
 }

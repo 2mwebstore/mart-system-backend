@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 
 	"com-mart/backend/internal/middleware"
 	"com-mart/backend/internal/models"
+	"com-mart/backend/internal/services"
 	"com-mart/backend/internal/utils"
 )
 
@@ -248,6 +250,10 @@ func (a *API) OpenShift(c *gin.Context) {
 	a.audit(c, "shift", "shift.open", "shift", shiftID, nil, gin.H{"device": d.Name, "opening_usd_cents": req.OpeningUSDCents, "opening_khr_riel": req.OpeningKHRRiel})
 	dto, _ := buildShift(a.DB, shiftID)
 	hideExpectedIfBlind(c, dto)
+	a.Notify.Send(services.AlertShiftOpened, fmt.Sprintf(
+		"🟢 <b>Shift opened</b>\n%s · %s\nOpening float: %s + ៛%d",
+		services.HTMLEscape(dto.DeviceName), services.HTMLEscape(dto.CashierName), services.FormatUSD(req.OpeningUSDCents), req.OpeningKHRRiel,
+	))
 	utils.OK(c, http.StatusCreated, dto)
 }
 
@@ -350,6 +356,17 @@ func (a *API) CloseShift(c *gin.Context) {
 		"counted_usd_cents": final.CountedUSDCents, "counted_khr_riel": final.CountedKHRRiel,
 		"diff_usd_cents": final.DiffUSDCents, "diff_khr_riel": final.DiffKHRRiel,
 	})
+	status := "✅ Balanced"
+	if final.DiffUSDCents < 0 || final.DiffKHRRiel < 0 {
+		status = "🔻 Short"
+	} else if final.DiffUSDCents > 0 || final.DiffKHRRiel > 0 {
+		status = "🔺 Over"
+	}
+	a.Notify.Send(services.AlertShiftClosed, fmt.Sprintf(
+		"🔒 <b>Shift closed</b>\n%s · %s\nGross sales: %s\nDiff: %s (%s / ៛%d)",
+		services.HTMLEscape(final.DeviceName), services.HTMLEscape(final.CashierName),
+		services.FormatUSD(final.GrossSalesCents), status, services.FormatUSD(final.DiffUSDCents), final.DiffKHRRiel,
+	))
 	utils.OK(c, http.StatusOK, final)
 }
 

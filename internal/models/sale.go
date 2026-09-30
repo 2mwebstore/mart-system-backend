@@ -55,6 +55,7 @@ type SaleItem struct {
 	UnitPriceCents int64  `gorm:"not null" json:"unit_price_cents"`
 	UnitCostCents  int64  `gorm:"not null" json:"unit_cost_cents"`
 	DiscountCents  int64  `gorm:"not null;default:0" json:"discount_cents"`
+	Note           string `gorm:"size:255;not null;default:''" json:"note"`
 	LineTotalCents int64  `gorm:"not null" json:"line_total_cents"`
 
 	Product *Product `gorm:"foreignKey:ProductID" json:"product,omitempty"`

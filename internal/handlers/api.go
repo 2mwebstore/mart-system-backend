@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strconv"
@@ -12,10 +13,12 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/go-playground/validator/v10"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"com-mart/backend/internal/config"
 	"com-mart/backend/internal/middleware"
 	"com-mart/backend/internal/models"
+	"com-mart/backend/internal/services"
 	"com-mart/backend/internal/utils"
 )
 
@@ -26,11 +29,16 @@ import (
 // that spans several tables (sales, shifts, PO receiving) runs in one
 // transaction via db.Transaction.
 type API struct {
-	DB  *gorm.DB
-	Cfg *config.Config
+	DB     *gorm.DB
+	Cfg    *config.Config
+	Notify *services.NotifyService
+	Backup *services.BackupService
 }
 
-func NewAPI(db *gorm.DB, cfg *config.Config) *API { return &API{DB: db, Cfg: cfg} }
+func NewAPI(db *gorm.DB, cfg *config.Config) *API {
+	notify := services.NewNotifyService(db)
+	return &API{DB: db, Cfg: cfg, Notify: notify, Backup: services.NewBackupService(db, cfg, notify)}
+}
 
 func bind(c *gin.Context, req interface{}) bool {
 	if err := c.ShouldBindJSON(req); err != nil {
@@ -101,6 +109,30 @@ func dbFail(c *gin.Context, err error) {
 		return
 	}
 	utils.RespondError(c, utils.NewAppError(http.StatusInternalServerError, "INTERNAL_ERROR", err.Error()))
+}
+
+// Document types nextDocNumber knows about — matches the seeded rows in
+// number_sequences (migration 000015).
+const (
+	DocSale          = "SALE"
+	DocExpense       = "EXPENSE"
+	DocPurchaseOrder = "PURCHASE_ORDER"
+)
+
+// nextDocNumber reads-and-increments a document type's counter under a row
+// lock (so two sales/expenses/POs created at the same instant never get the
+// same number) and formats it as "PREFIX-000001". Must be called inside the
+// same transaction that creates the row using the number, so a rolled-back
+// create doesn't burn a number.
+func nextDocNumber(tx *gorm.DB, docType string) (string, error) {
+	var seq models.NumberSequence
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("doc_type = ?", docType).First(&seq).Error; err != nil {
+		return "", err
+	}
+	if err := tx.Model(&models.NumberSequence{}).Where("doc_type = ?", docType).Update("next_number", seq.NextNumber+1).Error; err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s-%06d", seq.Prefix, seq.NextNumber), nil
 }
 
 // branchParam resolves the branch a request is about: ?branch_id=, falling

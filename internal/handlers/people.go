@@ -15,6 +15,7 @@ import (
 
 	"com-mart/backend/internal/middleware"
 	"com-mart/backend/internal/models"
+	"com-mart/backend/internal/services"
 	"com-mart/backend/internal/utils"
 )
 
@@ -156,6 +157,7 @@ func (a *API) DeleteCustomer(c *gin.Context) {
 
 type expenseDTO struct {
 	ID          uint64 `json:"id"`
+	Code        string `json:"code"`
 	BranchID    uint64 `json:"branch_id"`
 	Category    string `json:"category"`
 	AmountCents int64  `json:"amount_cents"`
@@ -174,7 +176,7 @@ type expenseReq struct {
 
 func (a *API) expenseQuery() *gorm.DB {
 	return a.DB.Table("expenses e").
-		Select("e.id, e.branch_id, e.category, e.amount_cents, DATE_FORMAT(e.expense_date,'%Y-%m-%d') AS expense_date, e.note, COALESCE(u.full_name,'') AS user").
+		Select("e.id, e.code, e.branch_id, e.category, e.amount_cents, DATE_FORMAT(e.expense_date,'%Y-%m-%d') AS expense_date, e.note, COALESCE(u.full_name,'') AS user").
 		Joins("LEFT JOIN users u ON u.id = e.user_id").
 		Where("e.deleted_at IS NULL")
 }
@@ -195,10 +197,11 @@ func (a *API) ListExpenses(c *gin.Context) {
 	}
 	base = base.Session(&gorm.Session{})
 	var agg struct {
-		Count int64
-		Total int64
+		Count      int64
+		Total      int64
+		Categories int64
 	}
-	if err := base.Select("COUNT(*) AS count, COALESCE(SUM(e.amount_cents), 0) AS total").Scan(&agg).Error; err != nil {
+	if err := base.Select("COUNT(*) AS count, COALESCE(SUM(e.amount_cents), 0) AS total, COUNT(DISTINCT e.category) AS categories").Scan(&agg).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -209,7 +212,7 @@ func (a *API) ListExpenses(c *gin.Context) {
 		dbFail(c, err)
 		return
 	}
-	pg.respond(c, rows, agg.Count, gin.H{"total_cents": agg.Total})
+	pg.respond(c, rows, agg.Count, gin.H{"total_cents": agg.Total, "categories": agg.Categories})
 }
 
 func (a *API) getExpense(id uint64) (*expenseDTO, error) {
@@ -238,12 +241,23 @@ func (a *API) CreateExpense(c *gin.Context) {
 		return
 	}
 	e := models.Expense{BranchID: req.BranchID, Category: models.ExpenseCategory(req.Category), AmountCents: req.AmountCents, ExpenseDate: day, Note: req.Note, UserID: middleware.UserIDFrom(c)}
-	if err := a.DB.Create(&e).Error; err != nil {
+	err := a.DB.Transaction(func(tx *gorm.DB) error {
+		code, err := nextDocNumber(tx, DocExpense)
+		if err != nil {
+			return err
+		}
+		e.Code = code
+		return tx.Create(&e).Error
+	})
+	if err != nil {
 		dbFail(c, err)
 		return
 	}
 	a.audit(c, "expenses", "expense.create", "expense", e.ID, nil, req)
 	dto, _ := a.getExpense(e.ID)
+	if dto != nil {
+		a.Notify.Send(services.AlertExpenseAdded, fmt.Sprintf("💸 <b>Expense added</b>\n%s · %s\n%s", services.HTMLEscape(string(e.Category)), services.FormatUSD(e.AmountCents), services.HTMLEscape(e.Note)))
+	}
 	utils.OK(c, http.StatusCreated, dto)
 }
 
@@ -520,6 +534,76 @@ func (a *API) UpdateUser(c *gin.Context) {
 	after, _ := a.loadUser(id)
 	a.audit(c, "users", "user.update", "user", id, beforeList[0], after[0])
 	utils.OK(c, http.StatusOK, after[0])
+}
+
+// userHasActivity reports whether the user has any transactional history —
+// sales, shifts, expenses, purchase orders, stock movements, cash movements,
+// void/refund approvals or a set exchange rate. Every one of these tables has
+// a FOREIGN KEY ... REFERENCES users(id) with no ON DELETE clause (i.e.
+// RESTRICT), so a hard delete would fail at the database anyway; this check
+// exists to give a clear, translatable reason instead of a raw MySQL error.
+func (a *API) userHasActivity(id uint64) (bool, error) {
+	checks := []struct{ table, column string }{
+		{"sales", "cashier_id"},
+		{"shifts", "user_id"},
+		{"expenses", "user_id"},
+		{"purchase_orders", "user_id"},
+		{"stock_movements", "user_id"},
+		{"cash_movements", "user_id"},
+		{"cash_movements", "approved_by_id"},
+		{"voids_refunds", "cashier_id"},
+		{"voids_refunds", "approved_by_id"},
+		{"exchange_rates", "set_by_user_id"},
+	}
+	for _, ch := range checks {
+		var count int64
+		if err := a.DB.Table(ch.table).Where(ch.column+" = ?", id).Count(&count).Error; err != nil {
+			return false, err
+		}
+		if count > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (a *API) DeleteUser(c *gin.Context) {
+	id, ok := idParam(c)
+	if !ok {
+		return
+	}
+	if id == middleware.UserIDFrom(c) {
+		fail(c, utils.NewAppError(http.StatusConflict, "CANNOT_DELETE_SELF", "You can't delete your own account."))
+		return
+	}
+	beforeList, err := a.loadUser(id)
+	if err != nil || len(beforeList) == 0 {
+		dbFail(c, gorm.ErrRecordNotFound)
+		return
+	}
+	inUse, err := a.userHasActivity(id)
+	if err != nil {
+		dbFail(c, err)
+		return
+	}
+	if inUse {
+		fail(c, utils.NewAppError(http.StatusConflict, "USER_IN_USE", "This user has sales, shifts or other activity and can't be deleted. Deactivate the account instead."))
+		return
+	}
+	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("user_id = ?", id).Delete(&models.UserBranch{}).Error; err != nil {
+			return err
+		}
+		// Hard delete: the unique index on username would otherwise stop the
+		// name being reused after a soft delete.
+		return tx.Unscoped().Delete(&models.User{}, id).Error
+	})
+	if err != nil {
+		dbFail(c, err)
+		return
+	}
+	a.audit(c, "users", "user.delete", "user", id, beforeList[0], nil)
+	utils.OK(c, http.StatusOK, gin.H{"deleted": true})
 }
 
 // ResetUserPIN issues a fresh random 4-digit PIN and returns it exactly once

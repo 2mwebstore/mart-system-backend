@@ -11,16 +11,17 @@ const (
 )
 
 type PurchaseOrder struct {
-	ID         uint64              `gorm:"primaryKey" json:"id"`
-	BranchID   uint64              `gorm:"not null;index" json:"branch_id"`
-	SupplierID uint64              `gorm:"not null;index" json:"supplier_id"`
-	Status     PurchaseOrderStatus `gorm:"size:20;not null;default:'DRAFT';index" json:"status"`
-	Note       string              `gorm:"size:255" json:"note"`
-	ShippingCents int64 `gorm:"not null;default:0" json:"shipping_cents"`
-	UserID     uint64              `gorm:"not null" json:"user_id"`
+	ID            uint64              `gorm:"primaryKey" json:"id"`
+	Code          string              `gorm:"size:30;not null" json:"code"`
+	BranchID      uint64              `gorm:"not null;index" json:"branch_id"`
+	SupplierID    uint64              `gorm:"not null;index" json:"supplier_id"`
+	Status        PurchaseOrderStatus `gorm:"size:20;not null;default:'DRAFT';index" json:"status"`
+	Note          string              `gorm:"size:255" json:"note"`
+	ShippingCents int64               `gorm:"not null;default:0" json:"shipping_cents"`
+	UserID        uint64              `gorm:"not null" json:"user_id"`
 	Timestamps
 
-	Supplier *Supplier              `gorm:"foreignKey:SupplierID" json:"supplier,omitempty"`
+	Supplier *Supplier           `gorm:"foreignKey:SupplierID" json:"supplier,omitempty"`
 	Items    []PurchaseOrderItem `gorm:"foreignKey:PurchaseOrderID" json:"items,omitempty"`
 }
 
@@ -42,19 +43,19 @@ func (PurchaseOrderItem) TableName() string { return "purchase_order_items" }
 type StockTransferStatus string
 
 const (
-	StockTransferDraft    StockTransferStatus = "DRAFT"
-	StockTransferSent     StockTransferStatus = "SENT"
-	StockTransferReceived StockTransferStatus = "RECEIVED"
+	StockTransferDraft     StockTransferStatus = "DRAFT"
+	StockTransferSent      StockTransferStatus = "SENT"
+	StockTransferReceived  StockTransferStatus = "RECEIVED"
 	StockTransferCancelled StockTransferStatus = "CANCELLED"
 )
 
 type StockTransfer struct {
-	ID            uint64              `gorm:"primaryKey" json:"id"`
-	FromBranchID  uint64              `gorm:"not null;index" json:"from_branch_id"`
-	ToBranchID    uint64              `gorm:"not null;index" json:"to_branch_id"`
-	Status        StockTransferStatus `gorm:"size:20;not null;default:'DRAFT';index" json:"status"`
-	Note          string              `gorm:"size:255" json:"note"`
-	UserID        uint64              `gorm:"not null" json:"user_id"`
+	ID           uint64              `gorm:"primaryKey" json:"id"`
+	FromBranchID uint64              `gorm:"not null;index" json:"from_branch_id"`
+	ToBranchID   uint64              `gorm:"not null;index" json:"to_branch_id"`
+	Status       StockTransferStatus `gorm:"size:20;not null;default:'DRAFT';index" json:"status"`
+	Note         string              `gorm:"size:255" json:"note"`
+	UserID       uint64              `gorm:"not null" json:"user_id"`
 	Timestamps
 
 	Items []StockTransferItem `gorm:"foreignKey:StockTransferID" json:"items,omitempty"`
@@ -81,11 +82,11 @@ const (
 )
 
 type StockCount struct {
-	ID        uint64           `gorm:"primaryKey" json:"id"`
-	BranchID  uint64           `gorm:"not null;index" json:"branch_id"`
-	Status    StockCountStatus `gorm:"size:20;not null;default:'OPEN';index" json:"status"`
-	Note      string           `gorm:"size:255" json:"note"`
-	UserID    uint64           `gorm:"not null" json:"user_id"`
+	ID       uint64           `gorm:"primaryKey" json:"id"`
+	BranchID uint64           `gorm:"not null;index" json:"branch_id"`
+	Status   StockCountStatus `gorm:"size:20;not null;default:'OPEN';index" json:"status"`
+	Note     string           `gorm:"size:255" json:"note"`
+	UserID   uint64           `gorm:"not null" json:"user_id"`
 	Timestamps
 
 	Items []StockCountItem `gorm:"foreignKey:StockCountID" json:"items,omitempty"`

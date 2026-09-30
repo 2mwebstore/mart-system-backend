@@ -8,6 +8,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"com-mart/backend/internal/models"
 	"com-mart/backend/internal/utils"
@@ -28,6 +29,13 @@ type demoProduct struct {
 	priceCents, cost   int64
 	stock              map[string]int64 // branch code -> qty on hand *now*
 	reorder            int64
+	// parent, when set, makes this row a variant of the product with that
+	// SKU (which must appear earlier in demoProducts) — category, supplier,
+	// unit and image are then inherited from the parent, same as a real
+	// variant created through the app, and variant is appended to the
+	// parent's name (English and Khmer) the same way composeVariantName
+	// does in internal/handlers/catalog.go.
+	parent, variant string
 }
 
 // Khmer product names, keyed by SKU.
@@ -35,6 +43,7 @@ var demoProductKm = map[string]string{
 	"DRK-001": "ទឹកបរិសុទ្ធ 500ml", "DRK-002": "កាហ្វេកំប៉ុង 240ml", "DRK-003": "ភេសជ្ជៈថាមពល 250ml", "DRK-004": "ទឹកដោះសណ្តែក 250ml",
 	"PAN-001": "មីកំប៉ុងរសមាន់", "PAN-002": "អង្ករម្លិះ 5kg", "PAN-003": "ទឹកត្រីស្រស់ 700ml", "PAN-004": "ស៊ុតមាន់ 10 គ្រាប់", "PAN-005": "នំបុ័ង",
 	"SNK-001": "ដំឡូងបំពង់ 60g", "HHD-001": "ទឹកលាងចាន 750ml", "PSC-001": "ថ្នាំដុសធ្មេញ 150g",
+	"HHD-002": "ថង់សំរាម",
 }
 
 var demoCategories = []struct{ en, km string }{
@@ -49,18 +58,28 @@ var demoSuppliers = []struct{ name, phone, contact, terms string }{
 }
 
 var demoProducts = []demoProduct{
-	{"DRK-001", "8850001001", "Drinking water 500ml", "Drinks", "Angkor Beverage Co.", "bottle", 30, 18, map[string]int64{"TK": 240, "BKK1": 96, "SS": 12}, 48},
-	{"DRK-002", "8850001002", "Iced coffee can 240ml", "Drinks", "Angkor Beverage Co.", "can", 75, 48, map[string]int64{"TK": 84, "BKK1": 40, "SS": 6}, 24},
-	{"DRK-003", "8850001003", "Energy drink 250ml", "Drinks", "Angkor Beverage Co.", "can", 70, 44, map[string]int64{"TK": 60, "BKK1": 18, "SS": 30}, 24},
-	{"DRK-004", "8850001004", "Soy milk 250ml", "Drinks", "Angkor Beverage Co.", "box", 55, 35, map[string]int64{"TK": 72, "BKK1": 20, "SS": 18}, 24},
-	{"PAN-001", "8850002001", "Instant noodles chicken", "Pantry", "Mekong FMCG Supply", "pack", 45, 28, map[string]int64{"TK": 150, "BKK1": 60, "SS": 40}, 60},
-	{"PAN-002", "8850002002", "Jasmine rice 5kg", "Pantry", "Golden Delta Distribution", "bag", 650, 510, map[string]int64{"TK": 22, "BKK1": 9, "SS": 4}, 10},
-	{"PAN-003", "8850002003", "Fish sauce 700ml", "Pantry", "Golden Delta Distribution", "bottle", 160, 110, map[string]int64{"TK": 34, "BKK1": 12, "SS": 8}, 15},
-	{"PAN-004", "8850002004", "Eggs 10 pack", "Pantry", "Golden Delta Distribution", "pack", 180, 135, map[string]int64{"TK": 26, "BKK1": 6, "SS": 14}, 20},
-	{"PAN-005", "8850002005", "Bread loaf", "Pantry", "Mekong FMCG Supply", "pcs", 120, 80, map[string]int64{"TK": 18, "BKK1": 8, "SS": 5}, 15},
-	{"SNK-001", "8850003001", "Potato chips 60g", "Snacks", "Mekong FMCG Supply", "pack", 90, 55, map[string]int64{"TK": 96, "BKK1": 40, "SS": 20}, 30},
-	{"HHD-001", "8850004001", "Dish soap 750ml", "Household", "Mekong FMCG Supply", "bottle", 195, 140, map[string]int64{"TK": 28, "BKK1": 10, "SS": 6}, 12},
-	{"PSC-001", "8850005001", "Toothpaste 150g", "Personal care", "Mekong FMCG Supply", "tube", 140, 95, map[string]int64{"TK": 20, "BKK1": 7, "SS": 5}, 12},
+	{sku: "DRK-001", barcode: "8850001001", name: "Drinking water 500ml", category: "Drinks", supplier: "Angkor Beverage Co.", unit: "bottle", priceCents: 30, cost: 18, stock: map[string]int64{"TK": 240, "BKK1": 96, "SS": 12}, reorder: 48},
+	{sku: "DRK-002", barcode: "8850001002", name: "Iced coffee can 240ml", category: "Drinks", supplier: "Angkor Beverage Co.", unit: "can", priceCents: 75, cost: 48, stock: map[string]int64{"TK": 84, "BKK1": 40, "SS": 6}, reorder: 24},
+	{sku: "DRK-003", barcode: "8850001003", name: "Energy drink 250ml", category: "Drinks", supplier: "Angkor Beverage Co.", unit: "can", priceCents: 70, cost: 44, stock: map[string]int64{"TK": 60, "BKK1": 18, "SS": 30}, reorder: 24},
+	{sku: "DRK-004", barcode: "8850001004", name: "Soy milk 250ml", category: "Drinks", supplier: "Angkor Beverage Co.", unit: "box", priceCents: 55, cost: 35, stock: map[string]int64{"TK": 72, "BKK1": 20, "SS": 18}, reorder: 24},
+	{sku: "PAN-001", barcode: "8850002001", name: "Instant noodles chicken", category: "Pantry", supplier: "Mekong FMCG Supply", unit: "pack", priceCents: 45, cost: 28, stock: map[string]int64{"TK": 150, "BKK1": 60, "SS": 40}, reorder: 60},
+	{sku: "PAN-002", barcode: "8850002002", name: "Jasmine rice 5kg", category: "Pantry", supplier: "Golden Delta Distribution", unit: "bag", priceCents: 650, cost: 510, stock: map[string]int64{"TK": 22, "BKK1": 9, "SS": 4}, reorder: 10},
+	{sku: "PAN-003", barcode: "8850002003", name: "Fish sauce 700ml", category: "Pantry", supplier: "Golden Delta Distribution", unit: "bottle", priceCents: 160, cost: 110, stock: map[string]int64{"TK": 34, "BKK1": 12, "SS": 8}, reorder: 15},
+	{sku: "PAN-004", barcode: "8850002004", name: "Eggs 10 pack", category: "Pantry", supplier: "Golden Delta Distribution", unit: "pack", priceCents: 180, cost: 135, stock: map[string]int64{"TK": 26, "BKK1": 6, "SS": 14}, reorder: 20},
+	{sku: "PAN-005", barcode: "8850002005", name: "Bread loaf", category: "Pantry", supplier: "Mekong FMCG Supply", unit: "pcs", priceCents: 120, cost: 80, stock: map[string]int64{"TK": 18, "BKK1": 8, "SS": 5}, reorder: 15},
+	{sku: "SNK-001", barcode: "8850003001", name: "Potato chips 60g", category: "Snacks", supplier: "Mekong FMCG Supply", unit: "pack", priceCents: 90, cost: 55, stock: map[string]int64{"TK": 96, "BKK1": 40, "SS": 20}, reorder: 30},
+	{sku: "HHD-001", barcode: "8850004001", name: "Dish soap 750ml", category: "Household", supplier: "Mekong FMCG Supply", unit: "bottle", priceCents: 195, cost: 140, stock: map[string]int64{"TK": 28, "BKK1": 10, "SS": 6}, reorder: 12},
+	{sku: "PSC-001", barcode: "8850005001", name: "Toothpaste 150g", category: "Personal care", supplier: "Mekong FMCG Supply", unit: "tube", priceCents: 140, cost: 95, stock: map[string]int64{"TK": 20, "BKK1": 7, "SS": 5}, reorder: 12},
+
+	// A product with variants, to exercise/showcase that feature in the demo
+	// data — HHD-002 is the parent (Sort/reorder point set at the family
+	// level: 3 sizes, each independently priced/stocked/barcoded), with
+	// three S/M/L variants. category/supplier/unit are inherited from the
+	// parent below, same as a real variant.
+	{sku: "HHD-002", barcode: "8850004002", name: "Trash bags", category: "Household", supplier: "Mekong FMCG Supply", unit: "roll", priceCents: 220, cost: 140, stock: map[string]int64{"TK": 40, "BKK1": 15, "SS": 8}, reorder: 15},
+	{sku: "HHD-002-S", barcode: "8850004003", parent: "HHD-002", variant: "Small", priceCents: 180, cost: 110, stock: map[string]int64{"TK": 30, "BKK1": 10, "SS": 6}, reorder: 10},
+	{sku: "HHD-002-M", barcode: "8850004004", parent: "HHD-002", variant: "Medium", priceCents: 220, cost: 140, stock: map[string]int64{"TK": 35, "BKK1": 12, "SS": 7}, reorder: 12},
+	{sku: "HHD-002-L", barcode: "8850004005", parent: "HHD-002", variant: "Large", priceCents: 260, cost: 170, stock: map[string]int64{"TK": 25, "BKK1": 9, "SS": 5}, reorder: 10},
 }
 
 func seedDemoData(db *gorm.DB, branches map[string]models.Branch, users map[string]models.User) {
@@ -94,7 +113,16 @@ func seedDemoTx(tx *gorm.DB, branches map[string]models.Branch, users map[string
 		{Key: "receipt_header", Value: "Com Mart"},
 		{Key: "receipt_footer", Value: "Thank you for shopping with us! សូមអរគុណ"},
 	} {
-		if err := tx.Save(&s).Error; err != nil {
+		// Save() on an existing `key` issues a full-column UPDATE using this
+		// freshly-built struct's zero-value CreatedAt, which MySQL's strict
+		// mode rejects as an invalid '0000-00-00' date. OnConflict only
+		// touches the columns actually being seeded, leaving created_at (and
+		// the row entirely, if it's untouched otherwise) alone — same
+		// pattern as BackupService.SaveActivityLogRetentionMonths.
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "key"}},
+			DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"}),
+		}).Create(&s).Error; err != nil {
 			return err
 		}
 	}
@@ -130,13 +158,30 @@ func seedDemoTx(tx *gorm.DB, branches map[string]models.Branch, users map[string
 	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local).AddDate(0, 0, -13)
 	prodID := map[string]uint64{}
 	byID := map[uint64]demoProduct{}
+	bySKU := map[string]models.Product{}
 	for _, dp := range demoProducts {
-		cid, sid := catID[dp.category], supID[dp.supplier]
 		bc := dp.barcode
-		p := models.Product{SKU: dp.sku, Barcode: &bc, NameEn: dp.name, NameKm: demoProductKm[dp.sku], CategoryID: &cid, SupplierID: &sid, Unit: dp.unit, Active: true}
+		p := models.Product{SKU: dp.sku, Barcode: &bc, Active: true}
+		if dp.parent != "" {
+			// A variant: category/supplier/unit/type/image are inherited
+			// from the parent (already created earlier in this slice), same
+			// rule as a real variant created through the app — see
+			// composeVariantName in internal/handlers/catalog.go.
+			parent := bySKU[dp.parent]
+			p.ParentProductID, p.VariantName = &parent.ID, dp.variant
+			p.NameEn = parent.NameEn + " — " + dp.variant
+			if parent.NameKm != "" {
+				p.NameKm = parent.NameKm + " — " + dp.variant
+			}
+			p.CategoryID, p.SupplierID, p.Unit, p.Type, p.ImageURL = parent.CategoryID, parent.SupplierID, parent.Unit, parent.Type, parent.ImageURL
+		} else {
+			cid, sid := catID[dp.category], supID[dp.supplier]
+			p.NameEn, p.NameKm, p.CategoryID, p.SupplierID, p.Unit, p.Type = dp.name, demoProductKm[dp.sku], &cid, &sid, dp.unit, models.ProductStandard
+		}
 		if err := tx.Create(&p).Error; err != nil {
 			return err
 		}
+		bySKU[dp.sku] = p
 		if err := tx.Create(&models.ProductPrice{ProductID: p.ID, PriceCents: dp.priceCents, CostCents: dp.cost, EffectiveAt: start.AddDate(0, 0, -30), CreatedAt: start}).Error; err != nil {
 			return err
 		}

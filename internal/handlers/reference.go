@@ -69,6 +69,18 @@ func (a *API) CreateBranch(c *gin.Context) {
 		invalid(c, "code", "That branch code is already in use.")
 		return
 	}
+	// If the creator currently has no branch access at all — the normal
+	// state right after a production reset, which now wipes every branch —
+	// grant them this one automatically, so creating a branch is enough to
+	// start using it, with no separate trip to Users & Roles to un-stick
+	// themselves. A no-op for the common case of an admin who already has
+	// access to other branches.
+	callerID := middleware.UserIDFrom(c)
+	var existingAccess int64
+	a.DB.Model(&models.UserBranch{}).Where("user_id = ?", callerID).Count(&existingAccess)
+	if existingAccess == 0 {
+		a.DB.Exec("INSERT IGNORE INTO user_branches (user_id, branch_id) VALUES (?, ?)", callerID, b.ID)
+	}
 	a.audit(c, "settings", "branch.create", "branch", b.ID, nil, toBranchDTO(b))
 	utils.OK(c, http.StatusCreated, toBranchDTO(b))
 }
@@ -339,12 +351,19 @@ type settingsDTO struct {
 	ReceiptHeader       string  `json:"receipt_header"`
 	ReceiptFooter       string  `json:"receipt_footer"`
 	LoyaltyPointsPerUSD float64 `json:"loyalty_points_per_usd"`
+	// AllowOutOfStockSale is store-wide (see UpdateStockPolicy below) —
+	// unlike the rest of this DTO it isn't writable through UpdateSettings,
+	// only read here so every authenticated caller (including the POS
+	// screen, which needs it to decide what to grey out) can see the
+	// current value without needing system.manage.
+	AllowOutOfStockSale bool `json:"allow_out_of_stock_sale"`
 }
 
 const (
 	settingReceiptHeader = "receipt_header"
 	settingReceiptFooter = "receipt_footer"
 	settingLoyalty       = "loyalty_points_per_usd"
+	settingAllowOOS      = "allow_out_of_stock_sale"
 )
 
 func (a *API) loadSettings() settingsDTO {
@@ -362,7 +381,10 @@ func (a *API) loadSettings() settingsDTO {
 	if header == "" {
 		header = "Com Mart"
 	}
-	return settingsDTO{ReceiptHeader: header, ReceiptFooter: m[settingReceiptFooter], LoyaltyPointsPerUSD: loyalty}
+	return settingsDTO{
+		ReceiptHeader: header, ReceiptFooter: m[settingReceiptFooter], LoyaltyPointsPerUSD: loyalty,
+		AllowOutOfStockSale: m[settingAllowOOS] == "true",
+	}
 }
 
 func (a *API) GetSettings(c *gin.Context) {
@@ -399,6 +421,32 @@ func (a *API) UpdateSettings(c *gin.Context) {
 	}
 	a.audit(c, "settings", "settings.update", "settings", 0, before, req)
 	utils.OK(c, http.StatusOK, a.loadSettings())
+}
+
+type stockPolicyReq struct {
+	AllowOutOfStockSale bool `json:"allow_out_of_stock_sale"`
+}
+
+// UpdateStockPolicy is the one store-wide switch for whether a sale can go
+// through at zero/negative stock (a backorder) — deliberately store-wide,
+// not per-product: see docs/DECISIONS.md for why this replaced the
+// per-product toggle from the previous turn. Gated by system.manage, same
+// standing as the other Settings > System controls (numbering, retention);
+// GetSettings (no permission needed) is how everything else, including the
+// POS screen, reads the current value.
+func (a *API) UpdateStockPolicy(c *gin.Context) {
+	var req stockPolicyReq
+	if !bind(c, &req) {
+		return
+	}
+	before := a.loadSettings().AllowOutOfStockSale
+	row := models.Setting{Key: settingAllowOOS, Value: strconv.FormatBool(req.AllowOutOfStockSale)}
+	if err := a.DB.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "key"}}, DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"})}).Create(&row).Error; err != nil {
+		dbFail(c, err)
+		return
+	}
+	a.audit(c, "settings", "settings.update", "settings", 0, gin.H{"allow_out_of_stock_sale": before}, gin.H{"allow_out_of_stock_sale": req.AllowOutOfStockSale})
+	utils.OK(c, http.StatusOK, gin.H{"allow_out_of_stock_sale": req.AllowOutOfStockSale})
 }
 
 // ---- Exchange rate ----------------------------------------------------------

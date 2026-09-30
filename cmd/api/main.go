@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"time"
 
@@ -51,11 +52,18 @@ func main() {
 	authService := services.NewAuthService(cfg, userRepo, refreshTokenRepo, deviceRepo, branchRepo, loginAttemptRepo)
 	authHandler := handlers.NewAuthHandler(authService)
 
+	api := handlers.NewAPI(db, cfg)
 	router := routes.Setup(routes.Dependencies{
 		Config:      cfg,
 		AuthHandler: authHandler,
-		API:         handlers.NewAPI(db, cfg),
+		API:         api,
 	})
+
+	// Nightly backup at local midnight (time.Local is APP_TIMEZONE, set
+	// above). Runs for the life of the process; see BackupSettings for the
+	// on/off switch and retention, changeable from Settings without a
+	// restart.
+	go api.Backup.RunScheduler(context.Background())
 
 	log.Info().Str("port", cfg.AppPort).Str("env", cfg.AppEnv).Msg("starting com-mart api")
 	if err := router.Run(":" + cfg.AppPort); err != nil {

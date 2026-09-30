@@ -403,6 +403,9 @@ func (a *API) TransactionsReport(c *gin.Context) {
 		if v := strings.TrimSpace(c.Query("q")); v != "" {
 			q = q.Where("s.receipt_no LIKE ?", "%"+v+"%")
 		}
+		if v := c.Query("product_id"); v != "" {
+			q = q.Where("EXISTS (SELECT 1 FROM sale_items si WHERE si.sale_id = s.id AND si.product_id = ?)", v)
+		}
 		return q
 	}
 
@@ -449,6 +452,7 @@ func (a *API) ByProductReport(c *gin.Context) {
 	pg := pagerOf(c)
 	from, to := dateRange(c)
 	type row struct {
+		ProductID    uint64 `json:"product_id"`
 		SKU          string `json:"sku"`
 		Name         string `json:"name"`
 		NameKm       string `json:"name_km"`
@@ -460,7 +464,7 @@ func (a *API) ByProductReport(c *gin.Context) {
 	}
 	var rows []row
 	err := a.DB.Table("sale_items si").
-		Select(`COALESCE(p.sku,'') AS sku, MAX(si.name_snapshot) AS name, COALESCE(MAX(p.name_km),'') AS name_km, SUM(si.qty) AS qty, SUM(si.line_total_cents) AS revenue_cents,
+		Select(`si.product_id, COALESCE(p.sku,'') AS sku, MAX(si.name_snapshot) AS name, COALESCE(MAX(p.name_km),'') AS name_km, SUM(si.qty) AS qty, SUM(si.line_total_cents) AS revenue_cents,
 			SUM(si.unit_cost_cents * si.qty) AS cost_cents`).
 		Joins("JOIN sales s ON s.id = si.sale_id AND s.status = 'PAID'").
 		Joins("LEFT JOIN products p ON p.id = si.product_id").
@@ -490,6 +494,7 @@ func (a *API) ByCashierReport(c *gin.Context) {
 	pg := pagerOf(c)
 	from, to := dateRange(c)
 	type row struct {
+		ID             uint64 `json:"id"`
 		Name           string `json:"name"`
 		Shifts         int64  `json:"shifts"`
 		SalesCents     int64  `json:"sales_cents"`
@@ -500,7 +505,7 @@ func (a *API) ByCashierReport(c *gin.Context) {
 		CashDiffCents  int64  `json:"cash_diff_cents"`
 	}
 	var rows []row
-	err := a.DB.Raw(`SELECT u.full_name AS name,
+	err := a.DB.Raw(`SELECT u.id, u.full_name AS name,
 			(SELECT COUNT(*) FROM shifts sh WHERE sh.user_id = u.id AND sh.branch_id = ? AND sh.opened_at >= ? AND sh.opened_at < ?) AS shifts,
 			COALESCE((SELECT SUM(s.total_cents) FROM sales s WHERE s.cashier_id = u.id AND s.branch_id = ? AND s.status='PAID' AND s.sold_at >= ? AND s.sold_at < ?),0) AS sales_cents,
 			(SELECT COUNT(*) FROM sales s WHERE s.cashier_id = u.id AND s.branch_id = ? AND s.status='PAID' AND s.sold_at >= ? AND s.sold_at < ?) AS transactions,
@@ -564,6 +569,7 @@ func (a *API) VoidsRefundsReport(c *gin.Context) {
 	from, to := dateRange(c)
 	type row struct {
 		ID          uint64    `json:"id"`
+		SaleID      uint64    `json:"sale_id"`
 		CreatedAt   time.Time `json:"created_at"`
 		ReceiptNo   string    `json:"receipt_no"`
 		Type        string    `json:"type"`
@@ -591,7 +597,7 @@ func (a *API) VoidsRefundsReport(c *gin.Context) {
 	}
 	var rows []row
 	err := pg.apply(base().
-		Select(`vr.id, vr.created_at, s.receipt_no, vr.type,
+		Select(`vr.id, vr.sale_id, vr.created_at, s.receipt_no, vr.type,
 			COALESCE((SELECT si.name_snapshot FROM sale_items si WHERE si.id = vr.sale_item_id), 'Whole sale') AS item,
 			vr.amount_cents, COALESCE(cu.full_name,'') AS cashier, COALESCE(au.full_name,'—') AS approved_by, vr.reason`).
 		Joins("LEFT JOIN users cu ON cu.id = vr.cashier_id").
@@ -642,6 +648,7 @@ func (a *API) ActivityLogReport(c *gin.Context) {
 		EntityType string    `json:"entity_type"`
 		EntityID   *uint64   `json:"entity_id"`
 		Device     string    `json:"device"`
+		IP         string    `json:"ip"`
 	}
 	base := func() *gorm.DB {
 		return a.DB.Table("activity_logs al").Joins("LEFT JOIN users u ON u.id = al.user_id").
@@ -658,7 +665,7 @@ func (a *API) ActivityLogReport(c *gin.Context) {
 	}
 	var rows []row
 	err := pg.apply(base().
-		Select("al.id, al.created_at, COALESCE(u.full_name,'') AS user, al.role, al.module, al.action, al.entity_type, al.entity_id, al.device").
+		Select("al.id, al.created_at, COALESCE(u.full_name,'') AS user, al.role, al.module, al.action, al.entity_type, al.entity_id, al.device, al.ip").
 		Order("al.created_at DESC, al.id DESC")).Scan(&rows).Error
 	if err != nil {
 		dbFail(c, err)
