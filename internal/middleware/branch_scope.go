@@ -21,7 +21,9 @@ func BranchScope() gin.HandlerFunc {
 		if raw == "" {
 			raw = c.Param("branch_id")
 		}
-		if raw == "" {
+		// "all" is only meaningful to ListSales, which scopes it to the
+		// caller's branches itself; everything else sees no branch filter.
+		if raw == "" || raw == "all" {
 			c.Next()
 			return
 		}

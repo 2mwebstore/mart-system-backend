@@ -167,17 +167,24 @@ type deviceReq struct {
 // PublicTills backs the POS sign-in screen, which has to list tills before
 // anyone is authenticated. Only active tills, and only what's needed to pick
 // one. (A real kiosk would be provisioned with its device key instead.)
+type publicTillDTO struct {
+	DeviceKey  string `json:"device_key"`
+	Name       string `json:"name"`
+	BranchID   uint64 `json:"branch_id"`
+	BranchName string `json:"branch_name"`
+}
+
 func (a *API) PublicTills(c *gin.Context) {
-	var rows []models.Device
-	if err := a.DB.Where("active = 1").Order("id").Find(&rows).Error; err != nil {
+	// branch_name lets the till picker say which branch each till is in.
+	rows := []publicTillDTO{}
+	if err := a.DB.Table("devices d").
+		Select("d.device_key, d.name, d.branch_id, COALESCE(b.name, '') AS branch_name").
+		Joins("LEFT JOIN branches b ON b.id = d.branch_id").
+		Where("d.active = 1").Order("b.name, d.name, d.id").Scan(&rows).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
-	out := make([]gin.H, len(rows))
-	for i, d := range rows {
-		out[i] = gin.H{"device_key": d.DeviceKey, "name": d.Name, "branch_id": d.BranchID}
-	}
-	utils.OK(c, http.StatusOK, out)
+	utils.OK(c, http.StatusOK, rows)
 }
 
 func (a *API) ListDevices(c *gin.Context) {

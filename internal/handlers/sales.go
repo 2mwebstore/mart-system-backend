@@ -47,6 +47,7 @@ type saleDTO struct {
 	CustomerID    *uint64        `json:"customer_id"`
 	CustomerName  string         `json:"customer_name"`
 	Status        string         `json:"status"`
+	ShiftStatus   string         `json:"shift_status"`
 	SubtotalCents int64          `json:"subtotal_cents"`
 	DiscountCents int64          `json:"discount_cents"`
 	TotalCents    int64          `json:"total_cents"`
@@ -77,9 +78,10 @@ func (a *API) loadSalesPage(pg pager, where string, args ...interface{}) ([]sale
 	}
 	q := a.DB.Table("sales s").
 		Select(`s.id, s.receipt_no, s.shift_id, s.branch_id, COALESCE(u.full_name,'') AS cashier, s.customer_id,
-			COALESCE(cu.name,'') AS customer_name, s.status, s.subtotal_cents, s.discount_cents, s.total_cents, s.total_riel, s.sold_at`).
+			COALESCE(cu.name,'') AS customer_name, COALESCE(sh.status,'') AS shift_status, s.status, s.subtotal_cents, s.discount_cents, s.total_cents, s.total_riel, s.sold_at`).
 		Joins("LEFT JOIN users u ON u.id = s.cashier_id").
 		Joins("LEFT JOIN customers cu ON cu.id = s.customer_id").
+		Joins("LEFT JOIN shifts sh ON sh.id = s.shift_id").
 		Order("s.sold_at DESC, s.id DESC")
 	if where != "" {
 		q = q.Where(where, args...)
@@ -142,19 +144,37 @@ func (a *API) loadSalesPage(pg pager, where string, args ...interface{}) ([]sale
 }
 
 // ListSales backs the POS "sales this shift" list (?shift_id=) and the
-// branch sales history (date range). Optional filters: status, q (receipt no).
+// sales history (date range). branch_id=all lists every branch the caller
+// can access. Optional filters: status, q (receipt no).
 func (a *API) ListSales(c *gin.Context) {
-	branchID := branchParam(c)
 	pg := pagerOf(c)
 	where := "s.branch_id = ?"
-	args := []interface{}{branchID}
+	args := []interface{}{branchParam(c)}
+	if c.Query("branch_id") == "all" {
+		ids := middleware.BranchIDsFrom(c)
+		if len(ids) == 0 {
+			pg.respond(c, []saleDTO{}, 0, nil)
+			return
+		}
+		where = "s.branch_id IN ?"
+		args = []interface{}{ids}
+	}
 	if sid := c.Query("shift_id"); sid != "" {
 		where += " AND s.shift_id = ?"
 		args = append(args, sid)
 	} else {
-		from, to := dateRange(c)
-		where += " AND s.sold_at >= ? AND s.sold_at < ?"
-		args = append(args, from, to)
+		// No dates = all history (paged), same as stock movements. A
+		// 14-day default here hid every older sale from the Sales tab.
+		if from, to := rangeBounds(c); from != nil || to != nil {
+			if from != nil {
+				where += " AND s.sold_at >= ?"
+				args = append(args, *from)
+			}
+			if to != nil {
+				where += " AND s.sold_at < ?"
+				args = append(args, *to)
+			}
+		}
 	}
 	if st := strings.ToUpper(c.Query("status")); st != "" {
 		where += " AND s.status = ?"
@@ -458,24 +478,37 @@ type lowStockHit struct {
 }
 
 type editSaleItem struct {
-	ProductID uint64 `json:"product_id" binding:"required"`
-	Qty       int64  `json:"qty" binding:"required,min=1"`
-	Note      string `json:"note" binding:"max=255"`
+	ProductID     uint64 `json:"product_id" binding:"required"`
+	Qty           int64  `json:"qty" binding:"required,min=1"`
+	DiscountCents int64  `json:"discount_cents" binding:"min=0"`
+	Note          string `json:"note" binding:"max=255"`
 }
 
+// editSalePayment is optional on an edit: when it's omitted the method,
+// tender and reference stay as they were and only the change is recalculated.
+type editSalePayment struct {
+	Method           string `json:"method" binding:"required,oneof=CASH KHQR CARD"`
+	ReceivedUSDCents int64  `json:"received_usd_cents" binding:"min=0"`
+	ReceivedKHRRiel  int64  `json:"received_khr_riel" binding:"min=0"`
+	Reference        string `json:"reference" binding:"max=120"`
+}
+
+// editSaleReq is the sale's full desired state (not a patch): the lines with
+// their discounts and notes, the cart-level discount, and optionally the
+// payment. Prices and stock still come from the server, same as CreateSale.
 type editSaleReq struct {
-	Items []editSaleItem `json:"items" binding:"required,min=1,dive"`
+	Items         []editSaleItem   `json:"items" binding:"required,min=1,dive"`
+	DiscountCents int64            `json:"discount_cents" binding:"min=0"`
+	Payment       *editSalePayment `json:"payment"`
 }
 
-// EditSale corrects what was rung up on a still-open-shift sale: the item
-// list (which products, how many of each) only — not the payment method or
-// amount tendered, not discounts. It's the same trust boundary as CreateSale
-// (prices come from the catalog, not the request) applied to a correction
-// instead of a fresh sale: old items' stock goes back, new items' stock is
-// taken, in one transaction, so the shelf count is never briefly wrong or
-// double-counted. Payment and loyalty points are recalculated to stay
-// arithmetically consistent with the new total — this isn't "editing
-// payment", the amount tendered is untouched, only what it owes/changes.
+// EditSale corrects a still-open-shift paid sale: its lines (products, qty,
+// per-line discount, note), the cart discount, and optionally the payment
+// (method, USD/riel tender, reference). Prices come from the catalog and the
+// discount rules are CreateSale's (pos.discount + the role's percent limit).
+// Old lines' stock goes back and new lines' stock is taken in the same
+// transaction, so the shelf count is never briefly wrong. Loyalty points are
+// re-granted on the new total. Only a paid sale on an open shift can be edited.
 func (a *API) EditSale(c *gin.Context) {
 	id, ok := idParam(c)
 	if !ok {
@@ -539,11 +572,12 @@ func (a *API) EditSale(c *gin.Context) {
 
 		// Price and stock-check the new lines exactly like CreateSale does —
 		// the request only ever says which products and how many.
-		var subtotal, cost int64
+		var subtotal, lineDiscounts, cost int64
 		lines := make([]models.SaleItem, 0, len(req.Items))
 		newServiceIDs := map[uint64]bool{}
 		merged := map[uint64]int64{}
-		notes := map[uint64]string{} // first occurrence wins, same as merged qty below
+		discounts := map[uint64]int64{}
+		notes := map[uint64]string{} // first occurrence wins, same as CreateSale
 		order := []uint64{}
 		for _, it := range req.Items {
 			if _, ok := merged[it.ProductID]; !ok {
@@ -551,6 +585,7 @@ func (a *API) EditSale(c *gin.Context) {
 				notes[it.ProductID] = it.Note
 			}
 			merged[it.ProductID] += it.Qty
+			discounts[it.ProductID] += it.DiscountCents
 		}
 		for _, pid := range order {
 			qty := merged[pid]
@@ -590,9 +625,14 @@ func (a *API) EditSale(c *gin.Context) {
 				}
 			}
 			gross := prod.PriceCents * qty
+			disc := discounts[pid]
+			if disc > gross {
+				disc = gross
+			}
 			subtotal += gross
+			lineDiscounts += disc
 			cost += prod.CostCents * qty
-			lines = append(lines, models.SaleItem{SaleID: id, ProductID: pid, NameSnapshot: prod.NameEn, Qty: qty, UnitPriceCents: prod.PriceCents, UnitCostCents: prod.CostCents, DiscountCents: 0, Note: notes[pid], LineTotalCents: gross})
+			lines = append(lines, models.SaleItem{SaleID: id, ProductID: pid, NameSnapshot: prod.NameEn, Qty: qty, UnitPriceCents: prod.PriceCents, UnitCostCents: prod.CostCents, DiscountCents: disc, Note: notes[pid], LineTotalCents: gross - disc})
 		}
 		for i := range lines {
 			if err := tx.Omit("Product").Create(&lines[i]).Error; err != nil {
@@ -607,31 +647,59 @@ func (a *API) EditSale(c *gin.Context) {
 			}
 		}
 
+		// Same discount rules as CreateSale: line discounts, then the cart
+		// discount clamped to what's left. Either needs pos.discount and must
+		// fit the role's percent limit.
+		afterLines := subtotal - lineDiscounts
+		cartDiscount := req.DiscountCents
+		if cartDiscount > afterLines {
+			cartDiscount = afterLines
+		}
+		totalDiscount := lineDiscounts + cartDiscount
+		total := afterLines - cartDiscount
+		if totalDiscount > 0 {
+			if !hasPerm(c, "pos.discount") {
+				return utils.ErrForbidden
+			}
+			if subtotal > 0 && float64(totalDiscount)*100/float64(subtotal) > float64(a.roleMaxDiscountPercent(c))+1e-9 {
+				return utils.NewAppError(http.StatusForbidden, "DISCOUNT_LIMIT_EXCEEDED", fmt.Sprintf("Your role can discount at most %d%% of a sale.", a.roleMaxDiscountPercent(c)))
+			}
+		}
+
 		// Keep the sale's own exchange rate — an edit corrects what was rung
 		// up, it doesn't re-price the sale at today's rate.
-		total := subtotal
 		totalRiel := utils.USDCentsToRiel(total, sale.ExchangeRate)
 		if err := tx.Model(&models.Sale{}).Where("id = ?", id).Updates(map[string]interface{}{
-			"subtotal_cents": subtotal, "discount_cents": 0, "total_cents": total, "total_riel": totalRiel, "cost_total_cents": cost,
+			"subtotal_cents": subtotal, "discount_cents": totalDiscount, "total_cents": total, "total_riel": totalRiel, "cost_total_cents": cost,
 		}).Error; err != nil {
 			return err
 		}
 
-		// The amount tendered is untouched; only what it owes / what's owed
-		// back is recalculated so the receipt stays arithmetically correct.
+		// Payment: the current row is the default; a payment in the request
+		// replaces method, tender and reference. Cash change is recomputed
+		// and must not be short; non-cash methods carry no tender.
 		var pay models.Payment
 		if err := tx.Where("sale_id = ?", id).First(&pay).Error; err != nil {
 			return err
 		}
-		payUpdates := map[string]interface{}{"amount_cents": total, "amount_riel": totalRiel}
-		if pay.Method == models.PaymentCash {
-			res, err := utils.CalculateChange(total, pay.ReceivedUSDCents, pay.ReceivedKHRRiel, sale.ExchangeRate)
+		method, recvUSD, recvKHR, reference := pay.Method, pay.ReceivedUSDCents, pay.ReceivedKHRRiel, pay.Reference
+		if req.Payment != nil {
+			method = models.PaymentMethod(req.Payment.Method)
+			recvUSD, recvKHR, reference = req.Payment.ReceivedUSDCents, req.Payment.ReceivedKHRRiel, req.Payment.Reference
+		}
+		payUpdates := map[string]interface{}{
+			"method": method, "reference": reference, "amount_cents": total, "amount_riel": totalRiel,
+			"received_usd_cents": int64(0), "received_khr_riel": int64(0), "change_usd_cents": int64(0), "change_khr_riel": int64(0),
+		}
+		if method == models.PaymentCash {
+			res, err := utils.CalculateChange(total, recvUSD, recvKHR, sale.ExchangeRate)
 			if err != nil {
 				return err
 			}
 			if res.ShortCents > 0 {
-				return utils.NewAppError(http.StatusUnprocessableEntity, "INSUFFICIENT_CASH", "This sale now totals more than the cash received — void it and ring up a new sale instead.")
+				return utils.NewAppError(http.StatusUnprocessableEntity, "INSUFFICIENT_CASH", "The amount tendered is less than the new total.")
 			}
+			payUpdates["received_usd_cents"], payUpdates["received_khr_riel"] = recvUSD, recvKHR
 			payUpdates["change_usd_cents"], payUpdates["change_khr_riel"] = res.ChangeUSDCents, res.ChangeKHRRiel
 		}
 		if err := tx.Model(&models.Payment{}).Where("sale_id = ?", id).Updates(payUpdates).Error; err != nil {

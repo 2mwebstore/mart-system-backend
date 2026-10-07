@@ -453,7 +453,7 @@ func (a *API) CreateProduct(c *gin.Context) {
 		return
 	}
 	nameEn, nameKm := req.NameEn, req.NameKm
-	categoryID, supplierID, imageURL, productType := req.CategoryID, req.SupplierID, req.ImageURL, req.productType()
+	categoryID, supplierID, imageURL, productType := req.CategoryID, req.SupplierID, strings.TrimSpace(req.ImageURL), req.productType()
 	if parent != nil {
 		// Shared fields always mirror the parent — never independently set
 		// on a variant, at creation or afterward (see UpdateProduct).
@@ -552,7 +552,7 @@ func (a *API) UpdateProduct(c *gin.Context) {
 	// A variant's category/supplier/image/type are never independently
 	// settable — always whatever they already are (kept in sync with the
 	// parent by the propagation below, never by this request's own values).
-	categoryID, supplierID, imageURL, productType := req.CategoryID, req.SupplierID, req.ImageURL, req.productType()
+	categoryID, supplierID, imageURL, productType := req.CategoryID, req.SupplierID, strings.TrimSpace(req.ImageURL), req.productType()
 	variantName := ""
 	if isVariant {
 		categoryID, supplierID, imageURL = before.CategoryID, before.SupplierID, before.ImageURL
@@ -653,7 +653,13 @@ type stockMovementDTO struct {
 	QtyChange    int64     `json:"qty_change"`
 	BalanceAfter int64     `json:"balance_after"`
 	User         string    `json:"user"`
-	Reference    string    `json:"reference"`
+	// Reference is the document's own number (receipt no., PO code); the
+	// raw type/id and the movement's note (e.g. "Edit INV-000004", "Void …")
+	// come along so the UI can tell a sale from its edit or void.
+	Reference     string  `json:"reference"`
+	ReferenceType string  `json:"reference_type"`
+	ReferenceID   *uint64 `json:"reference_id"`
+	Note          string  `json:"note"`
 }
 
 // stockMovementBase is the joined, date-scoped movement query without its
@@ -663,6 +669,7 @@ func (a *API) stockMovementBase(branchID uint64, from, to time.Time) *gorm.DB {
 		Joins("JOIN products p ON p.id = sm.product_id").
 		Joins("LEFT JOIN users u ON u.id = sm.user_id").
 		Joins("LEFT JOIN sales s ON sm.reference_type = 'SALE' AND s.id = sm.reference_id").
+		Joins("LEFT JOIN purchase_orders po ON sm.reference_type = 'PO' AND po.id = sm.reference_id").
 		Where("sm.branch_id = ? AND sm.created_at >= ? AND sm.created_at < ?", branchID, from, to)
 }
 
@@ -671,9 +678,10 @@ func (a *API) stockMovementQuery(branchID uint64, from, to time.Time) *gorm.DB {
 		Select(`sm.id, sm.created_at, p.sku, p.name_en AS product, p.name_km AS product_km, sm.type, sm.qty_change, sm.balance_after,
 			COALESCE(u.full_name, '') AS user,
 			CASE sm.reference_type
-				WHEN 'PO' THEN CONCAT('PO-', sm.reference_id)
+				WHEN 'PO' THEN COALESCE(NULLIF(po.code, ''), CONCAT('PO-', sm.reference_id))
 				WHEN 'SALE' THEN COALESCE(s.receipt_no, CONCAT('SALE-', sm.reference_id))
-				ELSE COALESCE(NULLIF(sm.note, ''), sm.reference_type) END AS reference`).
+				ELSE COALESCE(NULLIF(sm.note, ''), sm.reference_type) END AS reference,
+			sm.reference_type, sm.reference_id, sm.note`).
 		Order("sm.created_at DESC, sm.id DESC")
 }
 

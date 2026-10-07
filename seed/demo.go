@@ -490,7 +490,11 @@ func seedDemoTx(tx *gorm.DB, branches map[string]models.Branch, users map[string
 		}{{"PAN-002", 10, 510}}},
 	}
 	for _, pd := range pos {
-		po := models.PurchaseOrder{BranchID: branches[pd.branch].ID, SupplierID: supID[pd.supplier], Status: models.PurchaseOrderStatus(pd.status), Note: pd.note, ShippingCents: pd.shipping, UserID: users["heng.rithy"].ID}
+		code, err := seedDocNumber(tx, "PURCHASE_ORDER")
+		if err != nil {
+			return err
+		}
+		po := models.PurchaseOrder{Code: code, BranchID: branches[pd.branch].ID, SupplierID: supID[pd.supplier], Status: models.PurchaseOrderStatus(pd.status), Note: pd.note, ShippingCents: pd.shipping, UserID: users["heng.rithy"].ID}
 		po.CreatedAt = now.AddDate(0, 0, -pd.daysAgo)
 		po.UpdatedAt = po.CreatedAt
 		if err := tx.Omit("Supplier", "Items").Create(&po).Error; err != nil {
@@ -522,9 +526,27 @@ func seedDemoTx(tx *gorm.DB, branches map[string]models.Branch, users map[string
 		{11, models.ExpensePackaging, 3100, "Plastic bags restock"}, {13, models.ExpenseInternet, 2500, "Fiber internet"},
 	} {
 		day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local).AddDate(0, 0, -e.daysAgo)
-		if err := tx.Create(&models.Expense{BranchID: tk.ID, Category: e.cat, AmountCents: e.cents, ExpenseDate: day, Note: e.note, UserID: users["meas.bopha"].ID}).Error; err != nil {
+		code, err := seedDocNumber(tx, "EXPENSE")
+		if err != nil {
+			return err
+		}
+		if err := tx.Create(&models.Expense{Code: code, BranchID: tk.ID, Category: e.cat, AmountCents: e.cents, ExpenseDate: day, Note: e.note, UserID: users["meas.bopha"].ID}).Error; err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// seedDocNumber takes the next number from number_sequences, the same way the
+// app numbers a new PO or expense (handlers.nextDocNumber), so demo documents
+// get a real code instead of a blank one.
+func seedDocNumber(tx *gorm.DB, docType string) (string, error) {
+	var seq models.NumberSequence
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("doc_type = ?", docType).First(&seq).Error; err != nil {
+		return "", err
+	}
+	if err := tx.Model(&models.NumberSequence{}).Where("doc_type = ?", docType).Update("next_number", seq.NextNumber+1).Error; err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s-%06d", seq.Prefix, seq.NextNumber), nil
 }

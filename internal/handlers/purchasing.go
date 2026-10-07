@@ -23,6 +23,7 @@ type poItemDTO struct {
 	QtyOrdered    int64  `json:"qty_ordered"`
 	QtyReceived   int64  `json:"qty_received"`
 	UnitCostCents int64  `json:"unit_cost_cents"`
+	DiscountCents int64  `json:"discount_cents"`
 }
 
 type poDTO struct {
@@ -66,7 +67,7 @@ func (a *API) attachPOItems(pos []poDTO) error {
 	}
 	var items []itemRow
 	err := a.DB.Table("purchase_order_items i").
-		Select("i.purchase_order_id, i.product_id, p.name_en AS product_name, p.name_km AS product_name_km, p.sku, i.qty_ordered, i.qty_received, i.unit_cost_cents").
+		Select("i.purchase_order_id, i.product_id, p.name_en AS product_name, p.name_km AS product_name_km, p.sku, i.qty_ordered, i.qty_received, i.unit_cost_cents, i.discount_cents").
 		Joins("JOIN products p ON p.id = i.product_id").
 		Where("i.purchase_order_id IN ?", ids).Order("i.id").Scan(&items).Error
 	if err != nil {
@@ -156,7 +157,7 @@ func (a *API) ListPurchaseOrders(c *gin.Context) {
 		base.Session(&gorm.Session{}).Select("COUNT(*) AS total_orders, COALESCE(SUM(po.status = 'RECEIVED'),0) AS received, COALESCE(SUM(po.shipping_cents),0) AS shipping").Scan(&agg)
 		var itemCost struct{ Total int64 }
 		a.DB.Table("purchase_order_items poi").
-			Select("COALESCE(SUM(poi.qty_ordered * poi.unit_cost_cents), 0) AS total").
+			Select("COALESCE(SUM(poi.qty_ordered * poi.unit_cost_cents - poi.discount_cents), 0) AS total").
 			Where("poi.purchase_order_id IN (?)", base.Session(&gorm.Session{}).Select("po.id")).
 			Scan(&itemCost)
 
@@ -172,6 +173,19 @@ type poItemReq struct {
 	ProductID     uint64 `json:"product_id" binding:"required"`
 	Qty           int64  `json:"qty" binding:"required,min=1"`
 	UnitCostCents int64  `json:"unit_cost_cents" binding:"min=0"`
+	// Discount on the whole line, in cents. Can't exceed qty × unit cost.
+	DiscountCents int64 `json:"discount_cents" binding:"min=0"`
+}
+
+// netUnitCostCents is the effective unit cost of a line after its discount,
+// rounded to the cent. Receiving books stock at this cost so the valuation
+// reflects what was actually paid.
+func netUnitCostCents(unit, discount, qty int64) int64 {
+	if qty <= 0 {
+		return unit
+	}
+	gross := unit * qty
+	return (gross - discount + qty/2) / qty
 }
 
 type poReq struct {
@@ -242,7 +256,10 @@ func (a *API) savePO(c *gin.Context, existingID uint64) {
 			poID = existingID
 		}
 		for _, it := range req.Items {
-			row := models.PurchaseOrderItem{PurchaseOrderID: poID, ProductID: it.ProductID, QtyOrdered: it.Qty, UnitCostCents: it.UnitCostCents}
+			if it.DiscountCents > it.Qty*it.UnitCostCents {
+				return utils.NewAppError(http.StatusUnprocessableEntity, "PO_DISCOUNT_TOO_HIGH", "A line's discount can't be more than its cost.")
+			}
+			row := models.PurchaseOrderItem{PurchaseOrderID: poID, ProductID: it.ProductID, QtyOrdered: it.Qty, UnitCostCents: it.UnitCostCents, DiscountCents: it.DiscountCents}
 			if err := tx.Omit("Product").Create(&row).Error; err != nil {
 				return err
 			}
@@ -332,7 +349,8 @@ func (a *API) ReceivePurchaseOrder(c *gin.Context) {
 			if remaining <= 0 {
 				continue
 			}
-			if _, err := recordMovement(tx, po.BranchID, it.ProductID, models.StockMovementReceive, remaining, it.UnitCostCents, "PO", &id, userID, ""); err != nil {
+			netCost := netUnitCostCents(it.UnitCostCents, it.DiscountCents, it.QtyOrdered)
+			if _, err := recordMovement(tx, po.BranchID, it.ProductID, models.StockMovementReceive, remaining, netCost, "PO", &id, userID, ""); err != nil {
 				return err
 			}
 			if err := tx.Model(&models.PurchaseOrderItem{}).Where("id = ?", it.ID).Update("qty_received", it.QtyOrdered).Error; err != nil {
@@ -340,8 +358,8 @@ func (a *API) ReceivePurchaseOrder(c *gin.Context) {
 			}
 			var cur models.ProductPrice
 			err := tx.Where("product_id = ? AND branch_id IS NULL", it.ProductID).Order("effective_at DESC, id DESC").First(&cur).Error
-			if err == nil && cur.CostCents != it.UnitCostCents {
-				if err := tx.Create(&models.ProductPrice{ProductID: it.ProductID, PriceCents: cur.PriceCents, CostCents: it.UnitCostCents, EffectiveAt: time.Now(), CreatedAt: time.Now()}).Error; err != nil {
+			if err == nil && cur.CostCents != netCost {
+				if err := tx.Create(&models.ProductPrice{ProductID: it.ProductID, PriceCents: cur.PriceCents, CostCents: netCost, EffectiveAt: time.Now(), CreatedAt: time.Now()}).Error; err != nil {
 					return err
 				}
 			}

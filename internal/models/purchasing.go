@@ -34,6 +34,8 @@ type PurchaseOrderItem struct {
 	QtyOrdered      int64  `gorm:"not null" json:"qty_ordered"`
 	QtyReceived     int64  `gorm:"not null;default:0" json:"qty_received"`
 	UnitCostCents   int64  `gorm:"not null" json:"unit_cost_cents"`
+	// Line discount in cents on the whole line (qty × unit cost), not per unit.
+	DiscountCents int64 `gorm:"not null;default:0" json:"discount_cents"`
 
 	Product *Product `gorm:"foreignKey:ProductID" json:"product,omitempty"`
 }

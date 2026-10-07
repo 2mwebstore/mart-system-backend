@@ -186,12 +186,18 @@ func (a *API) expenseQuery() *gorm.DB {
 func (a *API) ListExpenses(c *gin.Context) {
 	branchID := branchParam(c)
 	pg := pagerOf(c)
-	from, to := dateRange(c)
-	if c.Query("date_from") == "" && c.Query("date_to") == "" {
-		from = today().AddDate(-1, 0, 0) // the Expenses page has no date filter
-	}
+	// No dates = all history (the Expenses page has no date filter); either
+	// side narrows it. A one-year default here hid every older expense.
 	base := a.DB.Table("expenses e").Joins("LEFT JOIN users u ON u.id = e.user_id").
-		Where("e.deleted_at IS NULL AND e.branch_id = ? AND e.expense_date >= ? AND e.expense_date < ?", branchID, from, to)
+		Where("e.deleted_at IS NULL AND e.branch_id = ?", branchID)
+	if from, to := rangeBounds(c); from != nil || to != nil {
+		if from != nil {
+			base = base.Where("e.expense_date >= ?", *from)
+		}
+		if to != nil {
+			base = base.Where("e.expense_date < ?", *to)
+		}
+	}
 	if cat := c.Query("category"); cat != "" {
 		base = base.Where("e.category = ?", cat)
 	}
@@ -206,7 +212,7 @@ func (a *API) ListExpenses(c *gin.Context) {
 		return
 	}
 	var rows []expenseDTO
-	err := pg.apply(base.Select("e.id, e.branch_id, e.category, e.amount_cents, DATE_FORMAT(e.expense_date,'%Y-%m-%d') AS expense_date, e.note, COALESCE(u.full_name,'') AS user").
+	err := pg.apply(base.Select("e.id, e.code, e.branch_id, e.category, e.amount_cents, DATE_FORMAT(e.expense_date,'%Y-%m-%d') AS expense_date, e.note, COALESCE(u.full_name,'') AS user").
 		Order("e.expense_date DESC, e.id DESC")).Scan(&rows).Error
 	if err != nil {
 		dbFail(c, err)
