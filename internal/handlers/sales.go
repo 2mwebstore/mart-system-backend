@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -238,6 +239,31 @@ type createSaleReq struct {
 		ReceivedKHRRiel  int64  `json:"received_khr_riel" binding:"min=0"`
 		Reference        string `json:"reference" binding:"max=120"`
 	} `json:"payment" binding:"required"`
+	// Set when this sale is payment for QR table orders (see
+	// table_orders.go): one order, or a whole table's open orders in one
+	// bill. Each is marked PAID in the same transaction, or the sale fails.
+	TableOrderID  *uint64  `json:"table_order_id"`
+	TableOrderIDs []uint64 `json:"table_order_ids" binding:"max=50"`
+}
+
+// tableOrderIDs is every table order this sale pays, without duplicates and
+// in ascending order, so two tills locking overlapping orders always take the
+// row locks in the same order (no deadlock).
+func (r createSaleReq) tableOrderIDs() []uint64 {
+	ids := append([]uint64{}, r.TableOrderIDs...)
+	if r.TableOrderID != nil {
+		ids = append(ids, *r.TableOrderID)
+	}
+	seen := map[uint64]bool{}
+	out := ids[:0]
+	for _, id := range ids {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 func (a *API) roleMaxDiscountPercent(c *gin.Context) int {
@@ -412,6 +438,11 @@ func (a *API) CreateSale(c *gin.Context) {
 			return err
 		}
 		saleID = sale.ID
+		for _, orderID := range req.tableOrderIDs() {
+			if err := closeTableOrderForSale(tx, orderID, device.BranchID, sale.ID, userID); err != nil {
+				return err
+			}
+		}
 		for i := range lines {
 			lines[i].SaleID = sale.ID
 			if err := tx.Omit("Product").Create(&lines[i]).Error; err != nil {

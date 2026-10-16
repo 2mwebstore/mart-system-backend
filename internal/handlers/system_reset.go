@@ -81,6 +81,7 @@ func (a *API) ResetForProduction(c *gin.Context) {
 		// stock_transfers, stock_counts, shifts, sales, expenses,
 		// daily_sales_summary) is already gone by the time it runs.
 		statements := []string{
+			"DELETE FROM table_orders", // before sales and products (its items reference products)
 			"DELETE FROM sales",
 			"DELETE FROM shifts",
 			"DELETE FROM purchase_orders",
@@ -96,6 +97,7 @@ func (a *API) ResetForProduction(c *gin.Context) {
 			"DELETE FROM refresh_tokens",
 			"DELETE FROM login_attempts",
 			"DELETE FROM devices",
+			"DELETE FROM dining_tables",
 			"DELETE FROM payment_methods",
 			"DELETE FROM backups", // the DB record only — files already on disk are untouched, see docs/DEPLOY.md
 			"DELETE FROM activity_logs",
@@ -158,6 +160,7 @@ func resetAutoIncrement(db *gorm.DB) {
 		"stock_counts", "stock_count_items", "sales", "sale_items", "payments", "voids_refunds",
 		"expenses", "payment_methods", "backups", "customers", "loyalty_transactions",
 		"activity_logs", "refresh_tokens", "login_attempts",
+		"dining_tables", "table_orders", "table_order_items",
 	}
 	for _, t := range tables {
 		if err := db.Exec("ALTER TABLE " + t + " AUTO_INCREMENT = 1").Error; err != nil {

@@ -50,6 +50,14 @@ func Setup(deps Dependencies) *gin.Engine {
 			// The POS sign-in screen lists tills before anyone is signed in.
 			auth.GET("/tills", deps.API.PublicTills)
 		}
+		// QR table ordering: the customer's phone has no account. The table
+		// token in the QR is the access check (see handlers/table_orders.go).
+		public := v1.Group("/public")
+		{
+			public.GET("/tables/:token/menu", deps.API.PublicTableMenu)
+			public.POST("/tables/:token/orders", deps.API.PlacePublicTableOrder)
+			public.GET("/table-orders/:token", deps.API.PublicTableOrderStatus)
+		}
 	}
 
 	api := deps.API
@@ -74,6 +82,12 @@ func Setup(deps Dependencies) *gin.Engine {
 		authed.POST("/devices", perm("branch.manage"), api.CreateDevice)
 		authed.PUT("/devices/:id", perm("branch.manage"), api.UpdateDevice)
 		authed.DELETE("/devices/:id", perm("branch.manage"), api.DeleteDevice)
+
+		authed.GET("/dining-tables", perm("branch.manage"), api.ListDiningTables)
+		authed.POST("/dining-tables", perm("branch.manage"), api.CreateDiningTable)
+		authed.POST("/dining-tables/bulk", perm("branch.manage"), api.CreateDiningTablesBulk)
+		authed.PUT("/dining-tables/:id", perm("branch.manage"), api.UpdateDiningTable)
+		authed.DELETE("/dining-tables/:id", perm("branch.manage"), api.DeleteDiningTable)
 
 		authed.GET("/payment-methods", api.ListPaymentMethods)
 		authed.POST("/payment-methods", perm("branch.manage"), api.CreatePaymentMethod)
@@ -167,6 +181,11 @@ func Setup(deps Dependencies) *gin.Engine {
 		authed.POST("/sales", perm("pos.sell"), api.CreateSale)
 		authed.PUT("/sales/:id", perm("pos.edit_sale"), api.EditSale)
 		authed.POST("/sales/:id/void", perm("pos.void"), api.VoidSale)
+		authed.GET("/table-orders", anyPerm("pos.sell", "report.sales"), api.ListTableOrders)
+		authed.GET("/table-board", anyPerm("pos.sell", "report.sales"), api.ListTableBoard)
+		authed.POST("/table-orders/:id/accept", perm("pos.sell"), api.AcceptTableOrder)
+		authed.POST("/table-orders/:id/cancel", perm("pos.sell"), api.CancelTableOrder)
+		authed.POST("/table-orders/move", perm("pos.sell"), api.MoveTableOrders)
 
 		// Reports
 		rep := authed.Group("/reports")

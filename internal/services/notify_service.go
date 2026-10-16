@@ -32,12 +32,13 @@ const (
 	AlertPOReceived    AlertType = "po_received"
 	AlertBackupSuccess AlertType = "backup_success"
 	AlertBackupFailed  AlertType = "backup_failed"
+	AlertTableOrder    AlertType = "table_order"
 )
 
 // AllAlertTypes is every alert a role can pick from, in display order.
 var AllAlertTypes = []AlertType{
 	AlertLowStock, AlertShiftOpened, AlertShiftClosed, AlertSaleCompleted, AlertVoidRefund, AlertExpenseAdded,
-	AlertPOReceived, AlertBackupSuccess, AlertBackupFailed,
+	AlertPOReceived, AlertBackupSuccess, AlertBackupFailed, AlertTableOrder,
 }
 
 const (
