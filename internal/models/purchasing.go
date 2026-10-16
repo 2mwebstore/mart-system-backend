@@ -16,7 +16,7 @@ type PurchaseOrder struct {
 	BranchID      uint64              `gorm:"not null;index" json:"branch_id"`
 	SupplierID    uint64              `gorm:"not null;index" json:"supplier_id"`
 	Status        PurchaseOrderStatus `gorm:"size:20;not null;default:'DRAFT';index" json:"status"`
-	Note          string              `gorm:"size:255" json:"note"`
+	Note          string              `gorm:"type:text" json:"note"` // rich text (sanitised HTML)
 	ShippingCents int64               `gorm:"not null;default:0" json:"shipping_cents"`
 	UserID        uint64              `gorm:"not null" json:"user_id"`
 	Timestamps

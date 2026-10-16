@@ -185,6 +185,7 @@ func seedRolesAndPermissions(db *gorm.DB) map[string]models.Role {
 		{Key: "settings.rate", Group: "user", Description: "Change the exchange rate"},
 		{Key: "branch.manage", Group: "user", Description: "Manage branches"},
 		{Key: "expense.manage", Group: "user", Description: "Manage expenses"},
+		{Key: "invoice.manage", Group: "invoice", Description: "Create invoices and record their payments"},
 		{Key: "system.manage", Group: "user", Description: "Manage Telegram alerts and database backups"},
 		// Deliberately not part of any grouped permission set below (posAll,
 		// inventoryOps, etc.) — only allKeys (the Owner role) grants it, so
@@ -229,7 +230,7 @@ func seedRolesAndPermissions(db *gorm.DB) map[string]models.Role {
 		},
 		{
 			name: "Manager", description: "Runs a branch: approvals, shifts, stock.",
-			permissions: concat(posAll, shiftAll, inventoryOps, []string{"report.sales", "report.export", "report.activity_log", "customer.view", "customer.manage", "expense.manage"}),
+			permissions: concat(posAll, shiftAll, inventoryOps, []string{"report.sales", "report.export", "report.activity_log", "customer.view", "customer.manage", "expense.manage", "invoice.manage"}),
 			maxDiscount: 20, refundNoApprovalCents: 2000,
 		},
 		{

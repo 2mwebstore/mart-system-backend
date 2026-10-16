@@ -670,6 +670,7 @@ func (a *API) stockMovementBase(branchID uint64, from, to time.Time) *gorm.DB {
 		Joins("LEFT JOIN users u ON u.id = sm.user_id").
 		Joins("LEFT JOIN sales s ON sm.reference_type = 'SALE' AND s.id = sm.reference_id").
 		Joins("LEFT JOIN purchase_orders po ON sm.reference_type = 'PO' AND po.id = sm.reference_id").
+		Joins("LEFT JOIN invoices inv ON sm.reference_type = 'INVOICE' AND inv.id = sm.reference_id").
 		Where("sm.branch_id = ? AND sm.created_at >= ? AND sm.created_at < ?", branchID, from, to)
 }
 
@@ -680,6 +681,7 @@ func (a *API) stockMovementQuery(branchID uint64, from, to time.Time) *gorm.DB {
 			CASE sm.reference_type
 				WHEN 'PO' THEN COALESCE(NULLIF(po.code, ''), CONCAT('PO-', sm.reference_id))
 				WHEN 'SALE' THEN COALESCE(s.receipt_no, CONCAT('SALE-', sm.reference_id))
+				WHEN 'INVOICE' THEN COALESCE(inv.code, CONCAT('INVOICE-', sm.reference_id))
 				ELSE COALESCE(NULLIF(sm.note, ''), sm.reference_type) END AS reference,
 			sm.reference_type, sm.reference_id, sm.note`).
 		Order("sm.created_at DESC, sm.id DESC")

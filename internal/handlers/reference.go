@@ -375,7 +375,7 @@ const (
 
 func (a *API) loadSettings() settingsDTO {
 	var rows []models.Setting
-	a.DB.Find(&rows)
+	a.DB.Where("`key` <> ?", settingCompanyLogo).Find(&rows) // the logo image is served on its own
 	m := map[string]string{}
 	for _, r := range rows {
 		m[r.Key] = r.Value
@@ -386,7 +386,10 @@ func (a *API) loadSettings() settingsDTO {
 	}
 	header := m[settingReceiptHeader]
 	if header == "" {
-		header = "Com Mart"
+		header = m[settingCompanyName]
+	}
+	if header == "" {
+		header = defaultStoreName
 	}
 	return settingsDTO{
 		ReceiptHeader: header, ReceiptFooter: m[settingReceiptFooter], LoyaltyPointsPerUSD: loyalty,

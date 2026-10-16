@@ -23,7 +23,8 @@ type resetForProductionReq struct {
 
 // ResetForProduction wipes every branch, product, category, supplier,
 // customer, sale, shift, stock movement, purchase order, expense, backup
-// record, activity log, exchange rate and setting — and every user account
+// record, activity log, exchange rate and setting (except the company name
+// and logo) — and every user account
 // except the one making this request. Only roles, permissions and the
 // caller's own account survive, so the caller can sign back in and start
 // configuring a real deployment — including its branches — completely from
@@ -82,6 +83,7 @@ func (a *API) ResetForProduction(c *gin.Context) {
 		// daily_sales_summary) is already gone by the time it runs.
 		statements := []string{
 			"DELETE FROM table_orders", // before sales and products (its items reference products)
+			"DELETE FROM invoices",     // before customers, products and branches (items/payments cascade)
 			"DELETE FROM sales",
 			"DELETE FROM shifts",
 			"DELETE FROM purchase_orders",
@@ -102,7 +104,9 @@ func (a *API) ResetForProduction(c *gin.Context) {
 			"DELETE FROM backups", // the DB record only — files already on disk are untouched, see docs/DEPLOY.md
 			"DELETE FROM activity_logs",
 			"DELETE FROM exchange_rates",
-			"DELETE FROM settings",
+			// Every setting except the company name + logo — those are the
+			// business's identity, not demo data.
+			"DELETE FROM settings WHERE `key` NOT IN ('" + settingCompanyName + "', '" + settingCompanyLogo + "')",
 			"DELETE FROM daily_sales_summary",
 			"DELETE FROM branches",
 		}
@@ -161,6 +165,7 @@ func resetAutoIncrement(db *gorm.DB) {
 		"expenses", "payment_methods", "backups", "customers", "loyalty_transactions",
 		"activity_logs", "refresh_tokens", "login_attempts",
 		"dining_tables", "table_orders", "table_order_items",
+		"invoices", "invoice_items", "invoice_payments",
 	}
 	for _, t := range tables {
 		if err := db.Exec("ALTER TABLE " + t + " AUTO_INCREMENT = 1").Error; err != nil {

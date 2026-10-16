@@ -290,6 +290,23 @@ func (a *API) ProfitLoss(c *gin.Context) {
 		dbFail(c, err)
 		return
 	}
+	// Invoices (back-office sales) count on their invoice date, paid or not —
+	// the stock left then. Shipping is part of their gross; line and invoice
+	// discounts together are their discount, so gross − discount = total.
+	var inv struct {
+		Gross    int64
+		Discount int64
+		Net      int64
+		Cogs     int64
+		Count    int64
+	}
+	if err := a.DB.Table("invoices").Select(`COALESCE(SUM(subtotal_cents + shipping_cents),0) AS gross,
+			COALESCE(SUM(line_discount_cents + discount_cents),0) AS discount, COALESCE(SUM(total_cents),0) AS net,
+			COALESCE(SUM(cost_total_cents),0) AS cogs, COUNT(*) AS count`).
+		Where("branch_id = ? AND status = 'OPEN' AND invoice_date >= ? AND invoice_date < ?", branchID, from, to).Scan(&inv).Error; err != nil {
+		dbFail(c, err)
+		return
+	}
 	var returns int64
 	a.DB.Table("voids_refunds vr").Select("COALESCE(SUM(vr.amount_cents),0)").
 		Joins("JOIN sales s ON s.id = vr.sale_id").
@@ -322,6 +339,28 @@ func (a *API) ProfitLoss(c *gin.Context) {
 		Joins("LEFT JOIN categories c ON c.id = p.category_id").
 		Where("s.branch_id = ? AND s.sold_at >= ? AND s.sold_at < ?", branchID, from, to).
 		Group("COALESCE(c.name_en,'Uncategorised')").Order("profit_cents DESC").Scan(&byCat)
+	var invCat []profRow
+	a.DB.Table("invoice_items ii").
+		Select("COALESCE(c.name_en,'Uncategorised') AS name, COALESCE(MAX(c.name_km),'') AS name_km, SUM(ii.line_total_cents - ii.unit_cost_cents * ii.qty) AS profit_cents").
+		Joins("JOIN invoices i ON i.id = ii.invoice_id AND i.status = 'OPEN'").
+		Joins("LEFT JOIN products p ON p.id = ii.product_id").
+		Joins("LEFT JOIN categories c ON c.id = p.category_id").
+		Where("i.branch_id = ? AND i.invoice_date >= ? AND i.invoice_date < ?", branchID, from, to).
+		Group("COALESCE(c.name_en,'Uncategorised')").Scan(&invCat)
+	for _, ic := range invCat {
+		merged := false
+		for i := range byCat {
+			if byCat[i].Name == ic.Name {
+				byCat[i].ProfitCents += ic.ProfitCents
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			byCat = append(byCat, ic)
+		}
+	}
+	sort.SliceStable(byCat, func(i, j int) bool { return byCat[i].ProfitCents > byCat[j].ProfitCents })
 	var posTotal int64
 	for _, r := range byCat {
 		if r.ProfitCents > 0 {
@@ -354,17 +393,36 @@ func (a *API) ProfitLoss(c *gin.Context) {
 		Date           string `json:"date"`
 		NetProfitCents int64  `json:"net_profit_cents"`
 	}
+	var dayInv []struct {
+		Date      string
+		NetCents  int64
+		CostCents int64
+	}
+	a.DB.Table("invoices").Select("DATE_FORMAT(invoice_date,'%Y-%m-%d') AS date, SUM(total_cents) AS net_cents, SUM(cost_total_cents) AS cost_cents").
+		Where("branch_id = ? AND status = 'OPEN' AND invoice_date >= ? AND invoice_date < ?", branchID, from, to).
+		Group("DATE_FORMAT(invoice_date,'%Y-%m-%d')").Scan(&dayInv)
+	invByDay := map[string]int64{}
+	for _, d := range dayInv {
+		invByDay[d.Date] = d.NetCents - d.CostCents
+	}
 	netByDay := make([]netDay, len(series))
 	for i, p := range series {
-		netByDay[i] = netDay{p.Date, p.NetSalesCents - p.CostCents - expByDay[p.Date]}
+		netByDay[i] = netDay{p.Date, p.NetSalesCents - p.CostCents + invByDay[p.Date] - expByDay[p.Date]}
 	}
 
+	posNet := agg.Net - returns
+	agg.Gross += inv.Gross
+	agg.Discount += inv.Discount
+	agg.Net += inv.Net
+	agg.Cogs += inv.Cogs
 	grossProfit := agg.Net - returns - agg.Cogs
 	utils.OK(c, http.StatusOK, gin.H{
 		"exchange_rate": a.currentRate(), "gross_sales_cents": agg.Gross, "discount_cents": agg.Discount, "returns_cents": returns,
 		"net_sales_cents": agg.Net - returns, "cogs_cents": agg.Cogs, "gross_profit_cents": grossProfit,
 		"expenses_by_category": exp, "total_expenses_cents": totalExp, "net_profit_cents": grossProfit - totalExp,
 		"profit_by_category": byCat, "net_profit_by_day": netByDay,
+		// Where net sales came from: the till, and invoices (by invoice date).
+		"pos_sales_cents": posNet, "invoice_sales_cents": inv.Net, "invoice_count": inv.Count,
 	})
 }
 
@@ -462,7 +520,7 @@ func (a *API) ByProductReport(c *gin.Context) {
 		ProfitCents  int64  `json:"profit_cents"`
 		MarginPct    int64  `json:"margin_pct"`
 	}
-	var rows []row
+	rows := []row{} // [] not null when nothing sold in the range
 	err := a.DB.Table("sale_items si").
 		Select(`si.product_id, COALESCE(p.sku,'') AS sku, MAX(si.name_snapshot) AS name, COALESCE(MAX(p.name_km),'') AS name_km, SUM(si.qty) AS qty, SUM(si.line_total_cents) AS revenue_cents,
 			SUM(si.unit_cost_cents * si.qty) AS cost_cents`).
@@ -474,6 +532,33 @@ func (a *API) ByProductReport(c *gin.Context) {
 		dbFail(c, err)
 		return
 	}
+	// Invoice lines (open invoices, by invoice date) count too, merged per product.
+	var invRows []row
+	if err := a.DB.Table("invoice_items ii").
+		Select(`ii.product_id, MAX(COALESCE(p.sku, ii.sku)) AS sku, MAX(ii.name_en) AS name, COALESCE(MAX(p.name_km), MAX(ii.name_km)) AS name_km, SUM(ii.qty) AS qty,
+			SUM(ii.line_total_cents) AS revenue_cents, SUM(ii.unit_cost_cents * ii.qty) AS cost_cents`).
+		Joins("JOIN invoices i ON i.id = ii.invoice_id AND i.status = 'OPEN'").
+		Joins("LEFT JOIN products p ON p.id = ii.product_id").
+		Where("i.branch_id = ? AND i.invoice_date >= ? AND i.invoice_date < ?", branchID, from, to).
+		Group("ii.product_id").Scan(&invRows).Error; err != nil {
+		dbFail(c, err)
+		return
+	}
+	at := map[uint64]int{}
+	for i, r := range rows {
+		at[r.ProductID] = i
+	}
+	for _, r := range invRows {
+		if i, ok := at[r.ProductID]; ok {
+			rows[i].Qty += r.Qty
+			rows[i].RevenueCents += r.RevenueCents
+			rows[i].CostCents += r.CostCents
+		} else {
+			at[r.ProductID] = len(rows)
+			rows = append(rows, r)
+		}
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].RevenueCents > rows[j].RevenueCents })
 	sum := gin.H{"products": len(rows)}
 	var units, revenue, profit int64
 	for i := range rows {

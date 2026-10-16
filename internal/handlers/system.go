@@ -336,7 +336,7 @@ func (a *API) GetNumberSequences(c *gin.Context) {
 }
 
 type numberSequenceReq struct {
-	DocType string `json:"doc_type" binding:"required,oneof=SALE EXPENSE PURCHASE_ORDER"`
+	DocType string `json:"doc_type" binding:"required,oneof=SALE EXPENSE PURCHASE_ORDER INVOICE"`
 	// Kept short deliberately: sales.receipt_no is VARCHAR(20), and
 	// "<prefix>-000001" needs 7 characters for the "-000001" part, so a
 	// longer prefix would risk truncating on that column specifically.

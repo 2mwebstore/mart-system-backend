@@ -192,7 +192,7 @@ type poReq struct {
 	BranchID      uint64      `json:"branch_id" binding:"required"`
 	SupplierID    uint64      `json:"supplier_id" binding:"required"`
 	Status        string      `json:"status" binding:"omitempty,oneof=DRAFT SENT PARTIAL CANCELLED"`
-	Note          string      `json:"note" binding:"max=255"`
+	Note          string      `json:"note" binding:"max=20000"` // rich text, sanitised on save
 	ShippingCents int64       `json:"shipping_cents" binding:"min=0"`
 	Items         []poItemReq `json:"items" binding:"required,min=1,dive"`
 }
@@ -229,7 +229,7 @@ func (a *API) savePO(c *gin.Context, existingID uint64) {
 			if err != nil {
 				return err
 			}
-			po := models.PurchaseOrder{Code: code, BranchID: req.BranchID, SupplierID: req.SupplierID, Status: models.PurchaseOrderStatus(status), Note: req.Note, ShippingCents: req.ShippingCents, UserID: middleware.UserIDFrom(c)}
+			po := models.PurchaseOrder{Code: code, BranchID: req.BranchID, SupplierID: req.SupplierID, Status: models.PurchaseOrderStatus(status), Note: utils.SanitizeRichText(req.Note), ShippingCents: req.ShippingCents, UserID: middleware.UserIDFrom(c)}
 			if err := tx.Omit("Supplier", "Items").Create(&po).Error; err != nil {
 				return err
 			}
@@ -246,7 +246,7 @@ func (a *API) savePO(c *gin.Context, existingID uint64) {
 				return utils.ErrForbidden
 			}
 			if err := tx.Model(&po).Updates(map[string]interface{}{
-				"branch_id": req.BranchID, "supplier_id": req.SupplierID, "status": status, "note": req.Note, "shipping_cents": req.ShippingCents,
+				"branch_id": req.BranchID, "supplier_id": req.SupplierID, "status": status, "note": utils.SanitizeRichText(req.Note), "shipping_cents": req.ShippingCents,
 			}).Error; err != nil {
 				return err
 			}

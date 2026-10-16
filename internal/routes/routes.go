@@ -24,6 +24,10 @@ func Setup(deps Dependencies) *gin.Engine {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
+	// A permission granted after someone signed in works straight away (see
+	// middleware.LivePermissions), not only after they sign out and in.
+	middleware.LivePermissions = deps.API.CurrentPermissions
+
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(middleware.RequestID())
@@ -49,6 +53,9 @@ func Setup(deps Dependencies) *gin.Engine {
 			auth.GET("/me", middleware.RequireAuth(deps.Config.JWTAccessSecret), deps.AuthHandler.Me)
 			// The POS sign-in screen lists tills before anyone is signed in.
 			auth.GET("/tills", deps.API.PublicTills)
+			// Company name + logo, shown on the sign-in pages too.
+			auth.GET("/branding", deps.API.GetBranding)
+			auth.GET("/branding/logo", deps.API.GetBrandingLogo)
 		}
 		// QR table ordering: the customer's phone has no account. The table
 		// token in the QR is the access check (see handlers/table_orders.go).
@@ -96,6 +103,7 @@ func Setup(deps Dependencies) *gin.Engine {
 
 		authed.GET("/settings", api.GetSettings)
 		authed.PUT("/settings", perm("branch.manage"), api.UpdateSettings)
+		authed.PUT("/settings/branding", perm("branch.manage"), api.UpdateBranding)
 		authed.GET("/exchange-rate", api.GetExchangeRate)
 		authed.POST("/exchange-rate", perm("settings.rate"), api.SetExchangeRate)
 
@@ -181,6 +189,16 @@ func Setup(deps Dependencies) *gin.Engine {
 		authed.POST("/sales", perm("pos.sell"), api.CreateSale)
 		authed.PUT("/sales/:id", perm("pos.edit_sale"), api.EditSale)
 		authed.POST("/sales/:id/void", perm("pos.void"), api.VoidSale)
+		// Back-office sales (invoices) — see handlers/invoices.go
+		invoices := perm("invoice.manage")
+		authed.GET("/invoices", anyPerm("invoice.manage", "report.sales"), api.ListInvoices)
+		authed.GET("/invoices/:id", anyPerm("invoice.manage", "report.sales"), api.GetInvoice)
+		authed.POST("/invoices", invoices, api.CreateInvoice)
+		authed.PUT("/invoices/:id", invoices, api.UpdateInvoice)
+		authed.POST("/invoices/:id/cancel", invoices, api.CancelInvoice)
+		authed.POST("/invoices/:id/payments", invoices, api.AddInvoicePayment)
+		authed.DELETE("/invoices/:id/payments/:paymentId", invoices, api.DeleteInvoicePayment)
+
 		authed.GET("/table-orders", anyPerm("pos.sell", "report.sales"), api.ListTableOrders)
 		authed.GET("/table-board", anyPerm("pos.sell", "report.sales"), api.ListTableBoard)
 		authed.POST("/table-orders/:id/accept", perm("pos.sell"), api.AcceptTableOrder)

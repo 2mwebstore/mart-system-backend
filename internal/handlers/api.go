@@ -135,6 +135,19 @@ func nextDocNumber(tx *gorm.DB, docType string) (string, error) {
 	return fmt.Sprintf("%s-%06d", seq.Prefix, seq.NextNumber), nil
 }
 
+// CurrentPermissions is a user's role permissions as they are now in the
+// database (an inactive or deleted user has none) — used by the permission
+// middleware when a token predates a grant.
+func (a *API) CurrentPermissions(userID uint64) []string {
+	var keys []string
+	a.DB.Table("users u").
+		Joins("JOIN role_permissions rp ON rp.role_id = u.role_id").
+		Joins("JOIN permissions p ON p.id = rp.permission_id").
+		Where("u.id = ? AND u.active = 1 AND u.deleted_at IS NULL", userID).
+		Pluck("p.`key`", &keys)
+	return keys
+}
+
 // branchParam resolves the branch a request is about: ?branch_id=, falling
 // back to the caller's first branch. Access to it is enforced by the
 // BranchScope middleware on the route group.
