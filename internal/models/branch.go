@@ -4,8 +4,9 @@ import "time"
 
 type Branch struct {
 	ID            uint64 `gorm:"primaryKey" json:"id"`
+	CompanyID     uint64 `gorm:"not null;index" json:"-"`
 	Name          string `gorm:"size:120;not null" json:"name"`
-	Code          string `gorm:"size:20;not null;uniqueIndex" json:"code"`
+	Code          string `gorm:"size:20;not null" json:"code"` // unique within the company
 	Address       string `gorm:"size:255" json:"address"`
 	Phone         string `gorm:"size:30" json:"phone"`
 	ReceiptFooter string `gorm:"size:500" json:"receipt_footer"`
@@ -24,9 +25,10 @@ func (Branch) TableName() string { return "branches" }
 // login and shift-tracking are scoped to.
 type Device struct {
 	ID         uint64     `gorm:"primaryKey" json:"id"`
+	CompanyID  uint64     `gorm:"not null;index" json:"-"`
 	BranchID   uint64     `gorm:"not null;index" json:"branch_id"`
 	Name       string     `gorm:"size:80;not null" json:"name"`
-	DeviceKey  string     `gorm:"size:64;not null;uniqueIndex" json:"device_key"`
+	DeviceKey  string     `gorm:"size:64;not null" json:"device_key"` // unique within the company
 	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
 	Active     bool       `gorm:"not null" json:"active"` // see note on Branch.Active above
 	Timestamps
@@ -36,8 +38,8 @@ type Device struct {
 
 func (Device) TableName() string { return "devices" }
 
-// Setting is a business-wide key/value config row (exchange_rate,
-// loyalty_rate, receipt header/footer, currency rounding, etc).
+// Setting is an install-wide key/value config row: backups and the alerts
+// about them. A company's own settings are CompanySetting rows.
 type Setting struct {
 	Key   string `gorm:"primaryKey;size:100" json:"key"`
 	Value string `gorm:"type:text" json:"value"`
@@ -47,9 +49,10 @@ type Setting struct {
 func (Setting) TableName() string { return "settings" }
 
 // NumberSequence backs the "PREFIX-000001" reference numbers on sales,
-// expenses and purchase orders — one row per document type. See
+// expenses and purchase orders — one row per company and document type. See
 // nextDocNumber in internal/handlers/api.go.
 type NumberSequence struct {
+	CompanyID  uint64 `gorm:"primaryKey" json:"-"`
 	DocType    string `gorm:"primaryKey;size:20;column:doc_type" json:"doc_type"`
 	Prefix     string `gorm:"size:20" json:"prefix"`
 	NextNumber uint64 `gorm:"not null;default:1" json:"next_number"`
@@ -63,6 +66,7 @@ func (NumberSequence) TableName() string { return "number_sequences" }
 // so historical reports never change when the rate changes later.
 type ExchangeRate struct {
 	ID             uint64    `gorm:"primaryKey" json:"id"`
+	CompanyID      uint64    `gorm:"not null;index" json:"-"`
 	RateRielPerUSD int64     `gorm:"not null" json:"rate_riel_per_usd"`
 	SetByUserID    uint64    `gorm:"not null;index" json:"set_by_user_id"`
 	EffectiveAt    time.Time `gorm:"not null;index" json:"effective_at"`
@@ -78,6 +82,7 @@ func (ExchangeRate) TableName() string { return "exchange_rates" }
 // payment's CASH|KHQR|CARD enum type; Type here uses the same values.
 type PaymentMethodRow struct {
 	ID         uint64  `gorm:"primaryKey" json:"id"`
+	CompanyID  uint64  `gorm:"not null;index" json:"-"`
 	Name       string  `gorm:"size:80;not null" json:"name"`
 	Type       string  `gorm:"size:10;not null" json:"type"`
 	FeePercent float64 `gorm:"type:decimal(5,2);not null;default:0" json:"fee_percent"`

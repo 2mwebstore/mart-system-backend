@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"html"
 	"regexp"
 	"strings"
 
@@ -35,4 +36,27 @@ func SanitizeRichText(html string) string {
 		return ""
 	}
 	return trailingEmptyParas.ReplaceAllString(clean, "")
+}
+
+var (
+	plainPolicy   = bluemonday.StrictPolicy()
+	plainBreaks   = regexp.MustCompile(`(?i)<br\s*/?>|</(p|li|h3|h4|blockquote)\s*>`)
+	plainListItem = regexp.MustCompile(`(?i)<li(\s[^>]*)?>`)
+)
+
+// RichTextPlain turns a rich-text note into plain text for a place that can't
+// show HTML (a Telegram alert): a line per paragraph or list item, list items
+// marked "• ", entities decoded, blank lines and runs of spaces dropped. The
+// result is text, not HTML: escape it again before putting it in HTML.
+func RichTextPlain(s string) string {
+	s = plainBreaks.ReplaceAllString(s, "\n")
+	s = plainListItem.ReplaceAllString(s, "• ")
+	s = html.UnescapeString(plainPolicy.Sanitize(s))
+	var lines []string
+	for _, line := range strings.Split(s, "\n") {
+		if line = strings.Join(strings.Fields(line), " "); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, "\n")
 }

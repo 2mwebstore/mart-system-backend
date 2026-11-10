@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -31,6 +32,15 @@ type Config struct {
 
 	LoginMaxAttempts    int `env:"LOGIN_MAX_ATTEMPTS" envDefault:"5"`
 	LoginLockoutMinutes int `env:"LOGIN_LOCKOUT_MINUTES" envDefault:"5"`
+	// AuthRateLimitPerMinute caps sign-in requests per client address (refresh
+	// and logout get twice this). 0 turns it off.
+	AuthRateLimitPerMinute int `env:"AUTH_RATE_LIMIT_PER_MINUTE" envDefault:"30"`
+
+	// ClientIPHeader names the header holding the real client address, set by
+	// the proxy in front of the API: X-Real-IP on Railway, CF-Connecting-IP
+	// behind Cloudflare. Empty means use the connection's address. Only name a
+	// header the proxy overwrites, or clients can claim any address they like.
+	ClientIPHeader string `env:"CLIENT_IP_HEADER"`
 
 	CORSAllowedOrigins []string `env:"CORS_ALLOWED_ORIGINS" envSeparator:","`
 
@@ -71,6 +81,29 @@ func Load() (*Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// minProductionSecretLen is the shortest signing secret production accepts.
+// HS256 is only as strong as its key, and a short one can be brute-forced
+// offline from a single token.
+const minProductionSecretLen = 32
+
+// Validate fails on settings that would leave the API insecure, so a bad deploy
+// refuses to start instead of running with them.
+func (c *Config) Validate() error {
+	if c.JWTAccessSecret == "" || c.JWTRefreshSecret == "" {
+		return errors.New("JWT_ACCESS_SECRET and JWT_REFRESH_SECRET must not be empty")
+	}
+	if !c.IsProduction() {
+		return nil
+	}
+	if len(c.JWTAccessSecret) < minProductionSecretLen || len(c.JWTRefreshSecret) < minProductionSecretLen {
+		return fmt.Errorf("JWT_ACCESS_SECRET and JWT_REFRESH_SECRET must be at least %d characters in production", minProductionSecretLen)
+	}
+	if c.JWTAccessSecret == c.JWTRefreshSecret {
+		return errors.New("JWT_ACCESS_SECRET and JWT_REFRESH_SECRET must be different in production")
+	}
+	return nil
 }
 
 // DSN builds the MySQL data source name for GORM/database-sql.

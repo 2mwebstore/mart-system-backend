@@ -8,7 +8,6 @@ import (
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
 
-	"com-mart/backend/internal/middleware"
 	"com-mart/backend/internal/utils"
 )
 
@@ -21,27 +20,24 @@ type resetForProductionReq struct {
 	Confirm string `json:"confirm" binding:"required"`
 }
 
-// ResetForProduction wipes every branch, product, category, supplier,
-// customer, sale, shift, stock movement, purchase order, expense, backup
-// record, activity log, exchange rate and setting (except the company name
-// and logo) — and every user account
-// except the one making this request. Only roles, permissions and the
-// caller's own account survive, so the caller can sign back in and start
-// configuring a real deployment — including its branches — completely from
-// scratch, rather than inheriting whatever demo/test branches happened to
-// exist before. (CreateBranch auto-grants the caller access to the first
-// branch they create afterward, since this reset leaves them with none —
-// see its own comment.) Every table this leaves empty also has its
+// ResetForProduction wipes every company and everything in it: branches,
+// products, categories, suppliers, customers, sales, shifts, stock
+// movements, purchase orders, expenses, invoices, roles, staff accounts,
+// company settings and numbering — plus every backup record, activity log
+// and exchange rate. Only the permissions, the Super admin role, the super
+// admin accounts and the install's own settings (backups and the platform's
+// alerts) survive, so the super admin can sign straight back in and create
+// the real companies, each with its own first Owner, completely from
+// scratch rather than inheriting whatever demo/test data happened to exist
+// before. Every table this leaves empty also has its
 // AUTO_INCREMENT counter reset to 1 (see resetAutoIncrement below), so the
 // first product/sale/etc. created after a reset really is id 1, not a
 // continuation of whatever numbering the wiped demo/test data left behind.
 // This is for standing up a brand-new production instance, never for
 // clearing out test data on a system that's already serving real customers.
 //
-// Gated by a dedicated system.reset permission — deliberately not part of
-// system.manage or any role's default grant, so enabling Telegram alerts or
-// backups for a Manager can never accidentally also hand them this. Only
-// the Owner role gets it (see seed/main.go's allKeys).
+// It covers every company at once, so it's the super admin's alone (the
+// /platform routes); no company account, the Owner neither, can reach it.
 //
 // Everything below runs in one transaction: if any step fails (a
 // foreign-key surprise from a table this comment missed, for instance) the
@@ -56,8 +52,6 @@ func (a *API) ResetForProduction(c *gin.Context) {
 		invalid(c, "confirm", "Type RESET exactly to confirm.")
 		return
 	}
-	callerID := middleware.UserIDFrom(c)
-
 	err := a.DB.Transaction(func(tx *gorm.DB) error {
 		// Order matters: every RESTRICT foreign key (the default — see
 		// docs/DECISIONS.md's soft-delete note for how that bit the app
@@ -74,13 +68,16 @@ func (a *API) ResetForProduction(c *gin.Context) {
 		// left to cascade: their user_id FK cascades from users, but their
 		// device_id FK does not (no ON DELETE clause — see migration 000002),
 		// and DELETE FROM devices below runs before users is ever touched, so
-		// any row still pointing at a device — including the caller's own,
-		// since the caller is never deleted — blocks it otherwise.
+		// any row still pointing at a device blocks it otherwise. A super
+		// admin never signs in at a till, so their own sessions stay.
 		//
-		// branches is deleted last of all: every other table with a RESTRICT
-		// FK into it (devices, branch_stock, stock_movements, purchase_orders,
-		// stock_transfers, stock_counts, shifts, sales, expenses,
-		// daily_sales_summary) is already gone by the time it runs.
+		// Staff accounts go before the roles they hold (users.role_id and
+		// user_branches.role_id both RESTRICT), and the roles before the
+		// branches some of them belong to (roles.branch_id). branches comes
+		// after every other table with a RESTRICT FK into it (devices,
+		// branch_stock, stock_movements, purchase_orders, stock_transfers,
+		// stock_counts, shifts, sales, expenses, daily_sales_summary), and the
+		// companies themselves go last.
 		statements := []string{
 			"DELETE FROM table_orders", // before sales and products (its items reference products)
 			"DELETE FROM invoices",     // before customers, products and branches (items/payments cascade)
@@ -96,31 +93,28 @@ func (a *API) ResetForProduction(c *gin.Context) {
 			"DELETE FROM customers",
 			"DELETE FROM suppliers",
 			"DELETE FROM categories",
-			"DELETE FROM refresh_tokens",
-			"DELETE FROM login_attempts",
+			"DELETE FROM refresh_tokens WHERE device_id IS NOT NULL OR user_id IN (SELECT id FROM users WHERE company_id IS NOT NULL)",
+			"DELETE FROM login_attempts WHERE device_id IS NOT NULL OR user_id IN (SELECT id FROM users WHERE company_id IS NOT NULL)",
 			"DELETE FROM devices",
 			"DELETE FROM dining_tables",
 			"DELETE FROM payment_methods",
-			"DELETE FROM backups", // the DB record only — files already on disk are untouched, see docs/DEPLOY.md
+			"DELETE FROM tax_rates", // after everything that used one
+			"DELETE FROM backups",   // the DB record only — files already on disk are untouched, see docs/DEPLOY.md
 			"DELETE FROM activity_logs",
 			"DELETE FROM exchange_rates",
-			// Every setting except the company name + logo — those are the
-			// business's identity, not demo data.
-			"DELETE FROM settings WHERE `key` NOT IN ('" + settingCompanyName + "', '" + settingCompanyLogo + "')",
 			"DELETE FROM daily_sales_summary",
+			"DELETE FROM users WHERE company_id IS NOT NULL",
+			"DELETE FROM roles WHERE company_id IS NOT NULL", // their permissions and limits cascade
 			"DELETE FROM branches",
+			"DELETE FROM company_settings",
+			"DELETE FROM number_sequences",
+			"DELETE FROM sku_counters",
+			"DELETE FROM companies",
 		}
 		for _, stmt := range statements {
 			if err := tx.Exec(stmt).Error; err != nil {
 				return err
 			}
-		}
-		// Every user except whoever is doing this — cascades their
-		// user_branches/refresh_tokens/login_attempts (the latter two are
-		// already gone above; user_branches was already gone too, once
-		// branches was deleted).
-		if err := tx.Exec("DELETE FROM users WHERE id != ?", callerID).Error; err != nil {
-			return err
 		}
 		return nil
 	})
@@ -143,7 +137,7 @@ func (a *API) ResetForProduction(c *gin.Context) {
 	resetAutoIncrement(a.DB)
 	// Written after commit, deliberately: this is meant to be the first
 	// entry in the fresh activity log, not something the reset itself wipes.
-	a.audit(c, "settings", "system.reset_for_production", "system", 0, nil, nil)
+	a.audit(c, "platform", "system.reset_for_production", "system", 0, nil, nil)
 	utils.OK(c, http.StatusOK, gin.H{"reset": true, "at": time.Now()})
 }
 
@@ -153,9 +147,9 @@ func (a *API) ResetForProduction(c *gin.Context) {
 // sales; shift_counts, cash_movements from shifts; purchase_order_items from
 // purchase_orders; stock_transfer_items from stock_transfers;
 // stock_count_items from stock_counts; product_prices from products;
-// loyalty_transactions from customers). roles/permissions/users aren't here
-// — they're not wiped (or, for users, not wiped *empty*: the caller's own
-// row survives, so its counter must stay put).
+// loyalty_transactions from customers), and the companies. roles and users
+// aren't here: the Super admin role and the super admins survive, so their
+// counters stay put.
 func resetAutoIncrement(db *gorm.DB) {
 	tables := []string{
 		"branches", "devices", "exchange_rates", "categories", "suppliers", "products", "product_prices",
@@ -165,7 +159,7 @@ func resetAutoIncrement(db *gorm.DB) {
 		"expenses", "payment_methods", "backups", "customers", "loyalty_transactions",
 		"activity_logs", "refresh_tokens", "login_attempts",
 		"dining_tables", "table_orders", "table_order_items",
-		"invoices", "invoice_items", "invoice_payments",
+		"invoices", "invoice_items", "invoice_payments", "companies", "tax_rates",
 	}
 	for _, t := range tables {
 		if err := db.Exec("ALTER TABLE " + t + " AUTO_INCREMENT = 1").Error; err != nil {

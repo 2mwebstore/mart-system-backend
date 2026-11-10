@@ -79,6 +79,10 @@ type invoiceDTO struct {
 	LineDiscountCents int64               `json:"line_discount_cents"`
 	DiscountCents     int64               `json:"discount_cents"`
 	ShippingCents     int64               `json:"shipping_cents"`
+	TaxRateID         *uint64             `json:"tax_rate_id"`
+	TaxName           string              `json:"tax_name"`
+	TaxPercent        float64             `json:"tax_percent"`
+	TaxCents          int64               `json:"tax_cents"` // on top of it all, shipping included; in TotalCents
 	TotalCents        int64               `json:"total_cents"`
 	PaidCents         int64               `json:"paid_cents"`
 	BalanceCents      int64               `json:"balance_cents"`
@@ -101,6 +105,7 @@ func (a *API) invoiceBase() *gorm.DB {
 const invoiceColumns = `i.id, i.code, i.branch_id, i.customer_id, cu.name AS customer_name, cu.phone AS customer_phone,
 	DATE_FORMAT(i.invoice_date, '%Y-%m-%d') AS invoice_date, DATE_FORMAT(i.due_date, '%Y-%m-%d') AS due_date,
 	i.status, i.payment_status, i.subtotal_cents, i.line_discount_cents, i.discount_cents, i.shipping_cents,
+	i.tax_rate_id, i.tax_name, i.tax_percent, i.tax_cents,
 	i.total_cents, i.paid_cents, GREATEST(i.total_cents - i.paid_cents, 0) AS balance_cents, i.exchange_rate,
 	(SELECT COALESCE(SUM(x.qty), 0) FROM invoice_items x WHERE x.invoice_id = i.id) AS item_count,
 	i.note, i.cancel_reason, COALESCE(u.full_name, '') AS created_by, i.created_at`
@@ -237,6 +242,11 @@ type invoiceReq struct {
 	// Money received when the invoice is made (create only; optional). Saved
 	// with the invoice in one transaction, as its first payment.
 	Payment *invoicePaymentReq `json:"payment"`
+	// An optional tax rate added on top (see tax_rates.go); none is no tax.
+	TaxRateID *uint64 `json:"tax_rate_id"`
+	// The invoice's own tax rate, set by UpdateInvoice: an edit keeps it as
+	// it was, the way it keeps its lines' cost.
+	keepTax models.TaxSnapshot
 }
 
 // invoiceDraft is a validated, priced request ready to write.
@@ -246,13 +256,20 @@ type invoiceDraft struct {
 	lines                                          []models.InvoiceItem
 	subtotal, lineDiscounts, discount, total, cost int64
 	service                                        map[uint64]bool
+	tax                                            models.TaxSnapshot
 }
 
 // priceInvoice checks the request against the catalog (product exists and is
 // active, not a family parent, this branch's cost) and works out the totals.
 // The unit price is the one on the request — back-office sales can be priced
 // for the customer (wholesale); the form fills in the catalog price.
-func (a *API) priceInvoice(tx *gorm.DB, req invoiceReq) (*invoiceDraft, error) {
+// priceInvoice works out an invoice's lines and totals. `kept` holds the
+// lines of the invoice being edited (by product): those products keep the
+// cost and names they were invoiced with — a catalog cost change since then
+// must not change an old invoice's profit — and can stay even if they've
+// since been deactivated. New products use today's cost. Prices are the ones
+// on the request (an invoice's price is typed in, not looked up).
+func (a *API) priceInvoice(tx *gorm.DB, req invoiceReq, kept map[uint64]models.InvoiceItem) (*invoiceDraft, error) {
 	d := &invoiceDraft{service: map[uint64]bool{}}
 	day, ok := parseDay(req.InvoiceDate)
 	if !ok {
@@ -267,7 +284,7 @@ func (a *API) priceInvoice(tx *gorm.DB, req invoiceReq) (*invoiceDraft, error) {
 		d.dueDate = &due
 	}
 	var cust models.Customer
-	if err := tx.Where("id = ? AND deleted_at IS NULL", req.CustomerID).First(&cust).Error; err != nil {
+	if err := tx.Where("id = ? AND deleted_at IS NULL AND company_id = (SELECT company_id FROM branches WHERE id = ?)", req.CustomerID, req.BranchID).First(&cust).Error; err != nil {
 		return nil, utils.NewValidationError(map[string]string{"customer_id": "Pick a customer."})
 	}
 	for _, it := range req.Items {
@@ -275,8 +292,20 @@ func (a *API) priceInvoice(tx *gorm.DB, req invoiceReq) (*invoiceDraft, error) {
 		if err := a.productQuery(req.BranchID).Where("p.id = ?", it.ProductID).Scan(&p).Error; err != nil {
 			return nil, err
 		}
-		if p.ID == 0 || !p.Active || p.VariantCount > 0 {
+		old, wasOn := kept[it.ProductID]
+		if wasOn && p.ID == 0 {
+			// Removed from the catalog since: keep the line as it was invoiced.
+			var gone models.Product
+			if err := tx.Unscoped().Select("id", "product_type").First(&gone, it.ProductID).Error; err != nil {
+				return nil, err
+			}
+			p = productDTO{ID: gone.ID, ProductType: string(gone.Type), Active: true}
+		}
+		if p.ID == 0 || (!wasOn && (!p.Active || p.VariantCount > 0)) {
 			return nil, utils.NewAppError(http.StatusUnprocessableEntity, "PRODUCT_UNAVAILABLE", fmt.Sprintf("Product #%d isn't available for sale.", it.ProductID))
+		}
+		if wasOn {
+			p.CostCents, p.NameEn, p.NameKm, p.SKU = old.UnitCostCents, old.NameEn, old.NameKm, old.SKU
 		}
 		gross := it.UnitPriceCents * it.Qty
 		disc := it.DiscountCents
@@ -301,6 +330,13 @@ func (a *API) priceInvoice(tx *gorm.DB, req invoiceReq) (*invoiceDraft, error) {
 		d.discount = afterLines
 	}
 	d.total = afterLines - d.discount + req.ShippingCents
+	// Tax on top of it all, shipping included (see tax_rates.go).
+	tax, err := a.taxRateFor(tx, a.branchCompany(req.BranchID), req.TaxRateID, req.keepTax)
+	if err != nil {
+		return nil, err
+	}
+	d.total += withTax(&tax, d.total)
+	d.tax = tax
 	return d, nil
 }
 
@@ -309,7 +345,7 @@ func (a *API) priceInvoice(tx *gorm.DB, req invoiceReq) (*invoiceDraft, error) {
 // Products that drop to (or below) their reorder point are appended to
 // lowStock, to be alerted once the transaction commits — like a POS sale.
 func (a *API) takeInvoiceStock(tx *gorm.DB, inv *models.Invoice, d *invoiceDraft, userID uint64, lowStock *[]lowStockHit) error {
-	allowOOS := a.loadSettings().AllowOutOfStockSale
+	allowOOS := a.loadSettings(a.branchCompany(inv.BranchID)).AllowOutOfStockSale
 	need := map[uint64]int64{}
 	for _, l := range d.lines {
 		if !d.service[l.ProductID] {
@@ -372,9 +408,9 @@ func (a *API) returnInvoiceStock(tx *gorm.DB, inv *models.Invoice, userID uint64
 	return nil
 }
 
-func (a *API) alertLowStock(hits []lowStockHit) {
+func (a *API) alertLowStock(companyID uint64, hits []lowStockHit) {
 	for _, hit := range hits {
-		a.Notify.Send(services.AlertLowStock, fmt.Sprintf("⚠️ <b>Low stock</b>\n%s: %d left (reorder point %d)", services.HTMLEscape(hit.name), hit.qty, hit.reorderPoint))
+		a.Notify.Send(companyID, services.AlertLowStock, fmt.Sprintf("⚠️ <b>Low stock</b>\n%s: %d left (reorder point %d)", services.HTMLEscape(hit.name), hit.qty, hit.reorderPoint))
 	}
 }
 
@@ -399,11 +435,11 @@ func (a *API) CreateInvoice(c *gin.Context) {
 	var id uint64
 	var lowStock []lowStockHit
 	err := a.DB.Transaction(func(tx *gorm.DB) error {
-		d, err := a.priceInvoice(tx, req)
+		d, err := a.priceInvoice(tx, req, nil)
 		if err != nil {
 			return err
 		}
-		code, err := nextDocNumber(tx, DocInvoice)
+		code, err := nextDocNumber(tx, companyOf(c), DocInvoice)
 		if err != nil {
 			return err
 		}
@@ -411,7 +447,8 @@ func (a *API) CreateInvoice(c *gin.Context) {
 			Code: code, BranchID: req.BranchID, CustomerID: req.CustomerID, InvoiceDate: d.invoiceDate, DueDate: d.dueDate,
 			Status: models.InvoiceOpen, PaymentStatus: invoicePaymentStatus(d.total, 0),
 			SubtotalCents: d.subtotal, LineDiscountCents: d.lineDiscounts, DiscountCents: d.discount, ShippingCents: req.ShippingCents,
-			TotalCents: d.total, CostTotalCents: d.cost, ExchangeRate: a.currentRate(), Note: utils.SanitizeRichText(req.Note), UserID: userID,
+			TotalCents: d.total, CostTotalCents: d.cost, ExchangeRate: a.currentRate(companyOf(c)), Note: utils.SanitizeRichText(req.Note), UserID: userID,
+			TaxSnapshot: d.tax,
 		}
 		if err := tx.Create(&inv).Error; err != nil {
 			return err
@@ -440,7 +477,7 @@ func (a *API) CreateInvoice(c *gin.Context) {
 		dbFail(c, err)
 		return
 	}
-	a.alertLowStock(lowStock)
+	a.alertLowStock(companyOf(c), lowStock)
 	a.audit(c, "invoice", "invoice.create", "invoice", id, nil, out)
 	utils.OK(c, http.StatusCreated, out)
 }
@@ -473,7 +510,18 @@ func (a *API) UpdateInvoice(c *gin.Context) {
 			return utils.NewAppError(http.StatusConflict, "INVOICE_CANCELLED", "A cancelled invoice can't be changed.")
 		}
 		req.BranchID = inv.BranchID // an invoice stays in its branch (its stock moved there)
-		d, err := a.priceInvoice(tx, req)
+		req.keepTax = inv.TaxSnapshot
+		var oldLines []models.InvoiceItem
+		if err := tx.Where("invoice_id = ?", id).Order("id").Find(&oldLines).Error; err != nil {
+			return err
+		}
+		kept := map[uint64]models.InvoiceItem{}
+		for _, l := range oldLines {
+			if _, seen := kept[l.ProductID]; !seen {
+				kept[l.ProductID] = l
+			}
+		}
+		d, err := a.priceInvoice(tx, req, kept)
 		if err != nil {
 			return err
 		}
@@ -497,6 +545,7 @@ func (a *API) UpdateInvoice(c *gin.Context) {
 			"subtotal_cents": d.subtotal, "line_discount_cents": d.lineDiscounts, "discount_cents": d.discount,
 			"shipping_cents": req.ShippingCents, "total_cents": d.total, "cost_total_cents": d.cost,
 			"payment_status": invoicePaymentStatus(d.total, inv.PaidCents), "note": utils.SanitizeRichText(req.Note),
+			"tax_rate_id": d.tax.TaxRateID, "tax_name": d.tax.TaxName, "tax_percent": d.tax.TaxPercent, "tax_cents": d.tax.TaxCents,
 		}).Error; err != nil {
 			return err
 		}
@@ -511,7 +560,7 @@ func (a *API) UpdateInvoice(c *gin.Context) {
 		dbFail(c, err)
 		return
 	}
-	a.alertLowStock(lowStock)
+	a.alertLowStock(companyOf(c), lowStock)
 	a.audit(c, "invoice", "invoice.update", "invoice", id, before, out)
 	utils.OK(c, http.StatusOK, out)
 }

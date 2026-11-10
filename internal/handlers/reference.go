@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -42,10 +43,10 @@ type branchReq struct {
 
 func (a *API) ListBranches(c *gin.Context) {
 	var rows []models.Branch
-	q := a.DB.Order("id")
-	// branch.manage sees every branch (it's the branch admin screen);
+	q := a.DB.Where("company_id = ?", companyOf(c)).Order("id")
+	// branch.view sees every branch of the company (it's the branch admin screen);
 	// everyone else only sees the branches they're assigned to.
-	if !hasPerm(c, "branch.manage") {
+	if !hasPerm(c, "branch.view") {
 		q = q.Where("id IN ?", middleware.BranchIDsFrom(c))
 	}
 	if err := q.Find(&rows).Error; err != nil {
@@ -64,9 +65,16 @@ func (a *API) CreateBranch(c *gin.Context) {
 	if !bind(c, &req) {
 		return
 	}
-	b := models.Branch{Code: strings.ToUpper(req.Code), Name: req.Name, Address: req.Address, Phone: req.Phone, ReceiptFooter: req.ReceiptFooter, Active: req.Active}
-	if err := a.DB.Create(&b).Error; err != nil {
-		invalid(c, "code", "That branch code is already in use.")
+	b := models.Branch{CompanyID: companyOf(c), Code: strings.ToUpper(req.Code), Name: req.Name, Address: req.Address, Phone: req.Phone, ReceiptFooter: req.ReceiptFooter, Active: req.Active}
+	err := a.DB.Transaction(func(tx *gorm.DB) error {
+		if b.Active {
+			if err := roomForActive(tx, b.CompanyID, branchLimit); err != nil {
+				return err
+			}
+		}
+		return tx.Create(&b).Error
+	})
+	if !branchSaved(c, err) {
 		return
 	}
 	// If the creator currently has no branch access at all — the normal
@@ -95,18 +103,40 @@ func (a *API) UpdateBranch(c *gin.Context) {
 		return
 	}
 	var b models.Branch
-	if err := a.DB.First(&b, id).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).First(&b, id).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
 	before := toBranchDTO(b)
 	b.Code, b.Name, b.Address, b.Phone, b.ReceiptFooter, b.Active = strings.ToUpper(req.Code), req.Name, req.Address, req.Phone, req.ReceiptFooter, req.Active
-	if err := a.DB.Save(&b).Error; err != nil {
-		invalid(c, "code", "That branch code is already in use.")
+	err := a.DB.Transaction(func(tx *gorm.DB) error {
+		if b.Active && !before.Active {
+			if err := roomForActive(tx, b.CompanyID, branchLimit); err != nil {
+				return err
+			}
+		}
+		return tx.Save(&b).Error
+	})
+	if !branchSaved(c, err) {
 		return
 	}
 	a.audit(c, "settings", "branch.update", "branch", b.ID, before, toBranchDTO(b))
 	utils.OK(c, http.StatusOK, toBranchDTO(b))
+}
+
+// branchSaved answers the client when saving a branch failed: the company's
+// branch limit, or else the code, unique within the company.
+func branchSaved(c *gin.Context, err error) bool {
+	var appErr *utils.AppError
+	if errors.As(err, &appErr) {
+		fail(c, err)
+		return false
+	}
+	if err != nil {
+		invalid(c, "code", "That branch code is already in use.")
+		return false
+	}
+	return true
 }
 
 func (a *API) DeleteBranch(c *gin.Context) {
@@ -115,7 +145,7 @@ func (a *API) DeleteBranch(c *gin.Context) {
 		return
 	}
 	var b models.Branch
-	if err := a.DB.First(&b, id).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).First(&b, id).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -174,13 +204,20 @@ type publicTillDTO struct {
 	BranchName string `json:"branch_name"`
 }
 
+// PublicTills lists one company's tills: the one whose code is in ?company=. An
+// unknown or disabled company is 404 UNKNOWN_COMPANY.
 func (a *API) PublicTills(c *gin.Context) {
+	company, err := a.activeCompanyByCode(c.Query("company"))
+	if err != nil {
+		fail(c, err)
+		return
+	}
 	// branch_name lets the till picker say which branch each till is in.
 	rows := []publicTillDTO{}
 	if err := a.DB.Table("devices d").
-		Select("d.device_key, d.name, d.branch_id, COALESCE(b.name, '') AS branch_name").
-		Joins("LEFT JOIN branches b ON b.id = d.branch_id").
-		Where("d.active = 1").Order("b.name, d.name, d.id").Scan(&rows).Error; err != nil {
+		Select("d.device_key, d.name, d.branch_id, b.name AS branch_name").
+		Joins("JOIN branches b ON b.id = d.branch_id AND b.deleted_at IS NULL").
+		Where("d.company_id = ? AND d.active = 1", company.ID).Order("b.name, d.name, d.id").Scan(&rows).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -189,7 +226,7 @@ func (a *API) PublicTills(c *gin.Context) {
 
 func (a *API) ListDevices(c *gin.Context) {
 	var rows []models.Device
-	if err := a.DB.Order("id").Find(&rows).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).Order("id").Find(&rows).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -202,10 +239,10 @@ func (a *API) ListDevices(c *gin.Context) {
 
 func (a *API) CreateDevice(c *gin.Context) {
 	var req deviceReq
-	if !bind(c, &req) {
+	if !bind(c, &req) || !a.ownBranch(c, req.BranchID) {
 		return
 	}
-	d := models.Device{BranchID: req.BranchID, Name: req.Name, DeviceKey: req.DeviceKey, Active: req.Active}
+	d := models.Device{CompanyID: companyOf(c), BranchID: req.BranchID, Name: req.Name, DeviceKey: req.DeviceKey, Active: req.Active}
 	if err := a.DB.Create(&d).Error; err != nil {
 		invalid(c, "device_key", "That device key is already registered.")
 		return
@@ -220,11 +257,11 @@ func (a *API) UpdateDevice(c *gin.Context) {
 		return
 	}
 	var req deviceReq
-	if !bind(c, &req) {
+	if !bind(c, &req) || !a.ownBranch(c, req.BranchID) {
 		return
 	}
 	var d models.Device
-	if err := a.DB.First(&d, id).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).First(&d, id).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -244,7 +281,7 @@ func (a *API) DeleteDevice(c *gin.Context) {
 		return
 	}
 	var d models.Device
-	if err := a.DB.First(&d, id).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).First(&d, id).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -260,6 +297,16 @@ func (a *API) DeleteDevice(c *gin.Context) {
 	}
 	a.audit(c, "settings", "till.delete", "device", id, toDeviceDTO(d), nil)
 	utils.OK(c, http.StatusOK, gin.H{"deleted": true})
+}
+
+// ownBranch refuses a branch that isn't the company's, answering 422 on
+// branch_id.
+func (a *API) ownBranch(c *gin.Context, branchID uint64) bool {
+	if !a.companyOwns(c, &models.Branch{}, branchID) {
+		invalid(c, "branch_id", "Branch is not valid.")
+		return false
+	}
+	return true
 }
 
 // ---- Payment methods -------------------------------------------------------
@@ -285,7 +332,7 @@ type paymentMethodReq struct {
 
 func (a *API) ListPaymentMethods(c *gin.Context) {
 	var rows []models.PaymentMethodRow
-	if err := a.DB.Order("id").Find(&rows).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).Order("id").Find(&rows).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -301,7 +348,7 @@ func (a *API) CreatePaymentMethod(c *gin.Context) {
 	if !bind(c, &req) {
 		return
 	}
-	p := models.PaymentMethodRow{Name: req.Name, Type: req.Type, FeePercent: req.FeePercent, Enabled: req.Enabled}
+	p := models.PaymentMethodRow{CompanyID: companyOf(c), Name: req.Name, Type: req.Type, FeePercent: req.FeePercent, Enabled: req.Enabled}
 	if err := a.DB.Create(&p).Error; err != nil {
 		dbFail(c, err)
 		return
@@ -320,7 +367,7 @@ func (a *API) UpdatePaymentMethod(c *gin.Context) {
 		return
 	}
 	var p models.PaymentMethodRow
-	if err := a.DB.First(&p, id).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).First(&p, id).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -340,7 +387,7 @@ func (a *API) DeletePaymentMethod(c *gin.Context) {
 		return
 	}
 	var p models.PaymentMethodRow
-	if err := a.DB.First(&p, id).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).First(&p, id).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -364,22 +411,56 @@ type settingsDTO struct {
 	// screen, which needs it to decide what to grey out) can see the
 	// current value without needing system.manage.
 	AllowOutOfStockSale bool `json:"allow_out_of_stock_sale"`
+	// DefaultCustomerID is the customer the POS starts every sale with (null:
+	// walk-in). Like AllowOutOfStockSale it's only read here, so the POS can
+	// see it; it's written by UpdateDefaultCustomer from the Customers page.
+	DefaultCustomerID   *uint64 `json:"default_customer_id"`
+	DefaultCustomerName string  `json:"default_customer_name"`
+	// TaxDefaults is the tax rate each place starts with. Like the default
+	// customer it's only read here; PUT /tax-rates/defaults writes it.
+	TaxDefaults taxDefaultsDTO `json:"tax_defaults"`
 }
 
 const (
-	settingReceiptHeader = "receipt_header"
-	settingReceiptFooter = "receipt_footer"
-	settingLoyalty       = "loyalty_points_per_usd"
-	settingAllowOOS      = "allow_out_of_stock_sale"
+	settingReceiptHeader   = "receipt_header"
+	settingReceiptFooter   = "receipt_footer"
+	settingLoyalty         = "loyalty_points_per_usd"
+	settingAllowOOS        = "allow_out_of_stock_sale"
+	settingDefaultCustomer = "pos_default_customer_id"
 )
 
-func (a *API) loadSettings() settingsDTO {
-	var rows []models.Setting
-	a.DB.Where("`key` <> ?", settingCompanyLogo).Find(&rows) // the logo image is served on its own
+// companySettings reads a company's own settings: every one but the logo
+// (served on its own), or just keys when given.
+func (a *API) companySettings(companyID uint64, keys ...string) map[string]string {
+	var rows []models.CompanySetting
+	q := a.DB.Where("company_id = ?", companyID)
+	if len(keys) > 0 {
+		q = q.Where("`key` IN ?", keys)
+	} else {
+		q = q.Where("`key` <> ?", settingCompanyLogo)
+	}
+	q.Find(&rows)
 	m := map[string]string{}
 	for _, r := range rows {
 		m[r.Key] = r.Value
 	}
+	return m
+}
+
+// saveCompanySettings writes some of a company's settings.
+func saveCompanySettings(tx *gorm.DB, companyID uint64, pairs map[string]string) error {
+	for k, v := range pairs {
+		row := models.CompanySetting{CompanyID: companyID, Key: k, Value: v}
+		if err := tx.Clauses(clause.OnConflict{DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"})}).Create(&row).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadSettings is a company's receipt, loyalty and stock settings.
+func (a *API) loadSettings(companyID uint64) settingsDTO {
+	m := a.companySettings(companyID)
 	loyalty, err := strconv.ParseFloat(m[settingLoyalty], 64)
 	if err != nil {
 		loyalty = 1
@@ -389,16 +470,28 @@ func (a *API) loadSettings() settingsDTO {
 		header = m[settingCompanyName]
 	}
 	if header == "" {
+		header = a.companyName(companyID)
+	}
+	if header == "" {
 		header = defaultStoreName
 	}
-	return settingsDTO{
+	out := settingsDTO{
 		ReceiptHeader: header, ReceiptFooter: m[settingReceiptFooter], LoyaltyPointsPerUSD: loyalty,
 		AllowOutOfStockSale: m[settingAllowOOS] == "true",
+		TaxDefaults:         a.taxDefaults(companyID, m),
 	}
+	// Only while that customer is still the company's: one deleted since (or
+	// wiped by a production reset) leaves the POS on walk-in.
+	if id, err := strconv.ParseUint(m[settingDefaultCustomer], 10, 64); err == nil && id > 0 {
+		if cu, err := a.getCustomer(companyID, id); err == nil {
+			out.DefaultCustomerID, out.DefaultCustomerName = &cu.ID, cu.Name
+		}
+	}
+	return out
 }
 
 func (a *API) GetSettings(c *gin.Context) {
-	utils.OK(c, http.StatusOK, a.loadSettings())
+	utils.OK(c, http.StatusOK, a.loadSettings(companyOf(c)))
 }
 
 func (a *API) UpdateSettings(c *gin.Context) {
@@ -410,27 +503,21 @@ func (a *API) UpdateSettings(c *gin.Context) {
 		invalid(c, "loyalty_points_per_usd", "Must be zero or more.")
 		return
 	}
-	before := a.loadSettings()
+	before := a.loadSettings(companyOf(c))
 	pairs := map[string]string{
 		settingReceiptHeader: req.ReceiptHeader,
 		settingReceiptFooter: req.ReceiptFooter,
 		settingLoyalty:       strconv.FormatFloat(req.LoyaltyPointsPerUSD, 'f', -1, 64),
 	}
 	err := a.DB.Transaction(func(tx *gorm.DB) error {
-		for k, v := range pairs {
-			row := models.Setting{Key: k, Value: v}
-			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "key"}}, DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"})}).Create(&row).Error; err != nil {
-				return err
-			}
-		}
-		return nil
+		return saveCompanySettings(tx, companyOf(c), pairs)
 	})
 	if err != nil {
 		dbFail(c, err)
 		return
 	}
 	a.audit(c, "settings", "settings.update", "settings", 0, before, req)
-	utils.OK(c, http.StatusOK, a.loadSettings())
+	utils.OK(c, http.StatusOK, a.loadSettings(companyOf(c)))
 }
 
 type stockPolicyReq struct {
@@ -449,14 +536,49 @@ func (a *API) UpdateStockPolicy(c *gin.Context) {
 	if !bind(c, &req) {
 		return
 	}
-	before := a.loadSettings().AllowOutOfStockSale
-	row := models.Setting{Key: settingAllowOOS, Value: strconv.FormatBool(req.AllowOutOfStockSale)}
-	if err := a.DB.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "key"}}, DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"})}).Create(&row).Error; err != nil {
+	before := a.loadSettings(companyOf(c)).AllowOutOfStockSale
+	if err := saveCompanySettings(a.DB, companyOf(c), map[string]string{settingAllowOOS: strconv.FormatBool(req.AllowOutOfStockSale)}); err != nil {
 		dbFail(c, err)
 		return
 	}
 	a.audit(c, "settings", "settings.update", "settings", 0, gin.H{"allow_out_of_stock_sale": before}, gin.H{"allow_out_of_stock_sale": req.AllowOutOfStockSale})
 	utils.OK(c, http.StatusOK, gin.H{"allow_out_of_stock_sale": req.AllowOutOfStockSale})
+}
+
+type defaultCustomerReq struct {
+	CustomerID *uint64 `json:"customer_id"`
+}
+
+// UpdateDefaultCustomer picks the customer the POS starts every sale with for
+// the caller's company; customer_id null (or 0) goes back to walk-in. Gated by
+// customer.update, like editing a customer on the Customers page it's set from. Answers
+// with the settings, as GetSettings does.
+func (a *API) UpdateDefaultCustomer(c *gin.Context) {
+	var req defaultCustomerReq
+	if !bind(c, &req) {
+		return
+	}
+	company := companyOf(c)
+	value := ""
+	if req.CustomerID != nil && *req.CustomerID > 0 {
+		if _, err := a.getCustomer(company, *req.CustomerID); err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				invalid(c, "customer_id", "No such customer.")
+				return
+			}
+			dbFail(c, err)
+			return
+		}
+		value = strconv.FormatUint(*req.CustomerID, 10)
+	}
+	before := a.loadSettings(company).DefaultCustomerID
+	if err := saveCompanySettings(a.DB, company, map[string]string{settingDefaultCustomer: value}); err != nil {
+		dbFail(c, err)
+		return
+	}
+	after := a.loadSettings(company)
+	a.audit(c, "settings", "settings.update", "settings", 0, gin.H{"default_customer_id": before}, gin.H{"default_customer_id": after.DefaultCustomerID})
+	utils.OK(c, http.StatusOK, after)
 }
 
 // ---- Exchange rate ----------------------------------------------------------
@@ -468,9 +590,10 @@ type exchangeRateDTO struct {
 	EffectiveAt time.Time `json:"effective_at"`
 }
 
-func (a *API) currentRate() int64 {
+// currentRate is the company's riel per USD now.
+func (a *API) currentRate(companyID uint64) int64 {
 	var r models.ExchangeRate
-	if err := a.DB.Order("effective_at DESC, id DESC").First(&r).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyID).Order("effective_at DESC, id DESC").First(&r).Error; err != nil {
 		return 4100
 	}
 	return r.RateRielPerUSD
@@ -481,6 +604,7 @@ func (a *API) GetExchangeRate(c *gin.Context) {
 	err := a.DB.Table("exchange_rates er").
 		Select("er.id, er.rate_riel_per_usd AS rate, COALESCE(u.full_name,'') AS set_by, er.effective_at").
 		Joins("LEFT JOIN users u ON u.id = er.set_by_user_id").
+		Where("er.company_id = ?", companyOf(c)).
 		Order("er.effective_at DESC, er.id DESC").Limit(50).Scan(&rows).Error
 	if err != nil {
 		dbFail(c, err)
@@ -500,8 +624,8 @@ func (a *API) SetExchangeRate(c *gin.Context) {
 	if !bind(c, &req) {
 		return
 	}
-	before := a.currentRate()
-	row := models.ExchangeRate{RateRielPerUSD: req.Rate, SetByUserID: middleware.UserIDFrom(c), EffectiveAt: time.Now(), CreatedAt: time.Now()}
+	before := a.currentRate(companyOf(c))
+	row := models.ExchangeRate{CompanyID: companyOf(c), RateRielPerUSD: req.Rate, SetByUserID: middleware.UserIDFrom(c), EffectiveAt: time.Now(), CreatedAt: time.Now()}
 	if err := a.DB.Create(&row).Error; err != nil {
 		dbFail(c, err)
 		return

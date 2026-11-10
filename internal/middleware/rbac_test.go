@@ -8,51 +8,36 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func TestRequirePermissionFallsBackToLivePermissions(t *testing.T) {
+func runGate(t *testing.T, held []string, gate gin.HandlerFunc) int {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
-	calls := 0
-	LivePermissions = func(userID uint64) []string {
-		calls++
-		if userID == 7 {
-			return []string{"invoice.manage", "pos.sell"}
-		}
-		return nil
-	}
-	defer func() { LivePermissions = nil; livePermissionCache.Clear() }()
+	r := gin.New()
+	r.GET("/x", func(c *gin.Context) {
+		c.Set(CtxPermissions, held)
+		c.Next()
+	}, gate, func(c *gin.Context) { c.Status(http.StatusOK) })
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/x", nil))
+	return w.Code
+}
 
-	run := func(userID uint64, tokenPerms []string, need string) (int, []string) {
-		w := httptest.NewRecorder()
-		c, r := gin.CreateTestContext(w)
-		var seen []string
-		r.GET("/x", func(c *gin.Context) {
-			c.Set(CtxUserID, userID)
-			c.Set(CtxPermissions, tokenPerms)
-			c.Next()
-		}, RequirePermission(need), func(c *gin.Context) {
-			seen = PermissionsFrom(c)
-			c.Status(http.StatusOK)
-		})
-		c.Request = httptest.NewRequest(http.MethodGet, "/x", nil)
-		r.HandleContext(c)
-		return w.Code, seen
+func TestRequirePermission(t *testing.T) {
+	if code := runGate(t, []string{"pos.sell"}, RequirePermission("pos.sell")); code != http.StatusOK {
+		t.Fatalf("held: want 200, got %d", code)
 	}
+	if code := runGate(t, []string{"pos.sell"}, RequirePermission("user.create")); code != http.StatusForbidden {
+		t.Fatalf("not held: want 403, got %d", code)
+	}
+	if code := runGate(t, nil, RequirePermission("pos.sell")); code != http.StatusForbidden {
+		t.Fatalf("no permissions: want 403, got %d", code)
+	}
+}
 
-	if code, _ := run(7, []string{"pos.sell"}, "pos.sell"); code != http.StatusOK || calls != 0 {
-		t.Fatalf("granted by the token: want 200 with no lookup, got %d (%d lookups)", code, calls)
+func TestRequireAnyPermission(t *testing.T) {
+	if code := runGate(t, []string{"b"}, RequireAnyPermission("a", "b")); code != http.StatusOK {
+		t.Fatalf("one held: want 200, got %d", code)
 	}
-	code, seen := run(7, []string{"pos.sell"}, "invoice.manage")
-	if code != http.StatusOK {
-		t.Fatalf("granted after sign-in: want 200, got %d", code)
-	}
-	if len(seen) != 2 {
-		t.Fatalf("handlers should see the merged permissions, got %v", seen)
-	}
-	if code, _ := run(8, []string{"pos.sell"}, "invoice.manage"); code != http.StatusForbidden {
-		t.Fatalf("not granted anywhere: want 403, got %d", code)
-	}
-	before := calls
-	run(8, []string{"pos.sell"}, "invoice.manage")
-	if calls != before {
-		t.Fatalf("a repeat miss within the cache window shouldn't query again")
+	if code := runGate(t, []string{"c"}, RequireAnyPermission("a", "b")); code != http.StatusForbidden {
+		t.Fatalf("none held: want 403, got %d", code)
 	}
 }

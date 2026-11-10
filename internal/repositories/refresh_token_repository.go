@@ -21,26 +21,32 @@ func (r *RefreshTokenRepository) Create(rt *models.RefreshToken) error {
 	return r.db.Create(rt).Error
 }
 
-// FindValidByHash returns a non-revoked, non-expired refresh token by its
-// SHA-256 hash, or nil if none matches.
-func (r *RefreshTokenRepository) FindValidByHash(tokenHash string) (*models.RefreshToken, error) {
+// FindByHash returns a refresh token by its SHA-256 hash, or nil if none
+// matches. Revoked and expired rows are returned too: refreshing has to tell a
+// replayed old token from one it has never seen.
+func (r *RefreshTokenRepository) FindByHash(tokenHash string) (*models.RefreshToken, error) {
 	var rt models.RefreshToken
-	err := r.db.
-		Where("token_hash = ? AND revoked_at IS NULL AND expires_at > ?", tokenHash, time.Now()).
-		First(&rt).Error
+	err := r.db.Where("token_hash = ?", tokenHash).First(&rt).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
 	return &rt, err
 }
 
-func (r *RefreshTokenRepository) Revoke(id uint64) error {
-	return r.db.Model(&models.RefreshToken{}).Where("id = ?", id).
-		Update("revoked_at", time.Now()).Error
+// RevokeIfActive revokes one token and reports whether this call was the one
+// that did it, so two simultaneous refreshes can't both rotate the same token.
+func (r *RefreshTokenRepository) RevokeIfActive(id uint64) (bool, error) {
+	res := r.db.Model(&models.RefreshToken{}).
+		Where("id = ? AND revoked_at IS NULL", id).
+		Update("revoked_at", time.Now())
+	return res.RowsAffected > 0, res.Error
 }
 
-func (r *RefreshTokenRepository) RevokeAllForUser(userID uint64) error {
-	return r.db.Model(&models.RefreshToken{}).
-		Where("user_id = ? AND revoked_at IS NULL", userID).
-		Update("revoked_at", time.Now()).Error
+// RevokeFamily revokes what's left of one login's tokens and returns how many
+// were still live.
+func (r *RefreshTokenRepository) RevokeFamily(familyID string) (int64, error) {
+	res := r.db.Model(&models.RefreshToken{}).
+		Where("family_id = ? AND revoked_at IS NULL", familyID).
+		Update("revoked_at", time.Now())
+	return res.RowsAffected, res.Error
 }

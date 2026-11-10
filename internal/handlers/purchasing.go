@@ -35,6 +35,10 @@ type poDTO struct {
 	Status        string      `json:"status"`
 	Note          string      `json:"note"`
 	ShippingCents int64       `json:"shipping_cents"`
+	TaxRateID     *uint64     `json:"tax_rate_id"`
+	TaxName       string      `json:"tax_name"`
+	TaxPercent    float64     `json:"tax_percent"`
+	TaxCents      int64       `json:"tax_cents"` // on the items after discounts plus shipping; never in stock cost
 	CreatedAt     string      `json:"created_at"`
 	Items         []poItemDTO `json:"items" gorm:"-"`
 }
@@ -45,7 +49,7 @@ func (a *API) poSelect() *gorm.DB {
 		Joins("LEFT JOIN suppliers s ON s.id = po.supplier_id")
 }
 
-const poColumns = "po.id, po.code, po.branch_id, po.supplier_id, COALESCE(s.name,'') AS supplier_name, po.status, po.note, po.shipping_cents, DATE_FORMAT(po.created_at,'%Y-%m-%d') AS created_at"
+const poColumns = "po.id, po.code, po.branch_id, po.supplier_id, COALESCE(s.name,'') AS supplier_name, po.status, po.note, po.shipping_cents, po.tax_rate_id, po.tax_name, po.tax_percent, po.tax_cents, DATE_FORMAT(po.created_at,'%Y-%m-%d') AS created_at"
 
 // attachPOItems fills Items on a set of PO headers (Code already comes from
 // poColumns — see the migration 000015 note on why it's a real stored column
@@ -195,6 +199,9 @@ type poReq struct {
 	Note          string      `json:"note" binding:"max=20000"` // rich text, sanitised on save
 	ShippingCents int64       `json:"shipping_cents" binding:"min=0"`
 	Items         []poItemReq `json:"items" binding:"required,min=1,dive"`
+	// An optional tax rate on the items after discounts plus shipping (see
+	// tax_rates.go). It's what is owed the supplier, never the stock's cost.
+	TaxRateID *uint64 `json:"tax_rate_id"`
 }
 
 func (a *API) savePO(c *gin.Context, existingID uint64) {
@@ -212,6 +219,13 @@ func (a *API) savePO(c *gin.Context, existingID uint64) {
 	for i, it := range req.Items {
 		ids[i] = it.ProductID
 	}
+	if !a.companyOwns(c, &models.Supplier{}, req.SupplierID) {
+		invalid(c, "supplier_id", "Supplier not found.")
+		return
+	}
+	if !a.ownProducts(c, ids) {
+		return
+	}
 	var serviceCount int64
 	a.DB.Model(&models.Product{}).Where("id IN ? AND product_type = ?", ids, models.ProductService).Count(&serviceCount)
 	if serviceCount > 0 {
@@ -222,14 +236,25 @@ func (a *API) savePO(c *gin.Context, existingID uint64) {
 	if status == "" {
 		status = string(models.PurchaseOrderDraft)
 	}
+	// What tax is worked out on: the lines after their discounts, plus
+	// shipping. (A discount over its line is refused below.)
+	taxBase := req.ShippingCents
+	for _, it := range req.Items {
+		taxBase += it.Qty*it.UnitCostCents - it.DiscountCents
+	}
 	var poID uint64
 	err := a.DB.Transaction(func(tx *gorm.DB) error {
 		if existingID == 0 {
-			code, err := nextDocNumber(tx, DocPurchaseOrder)
+			tax, err := a.taxRateFor(tx, companyOf(c), req.TaxRateID, models.TaxSnapshot{})
 			if err != nil {
 				return err
 			}
-			po := models.PurchaseOrder{Code: code, BranchID: req.BranchID, SupplierID: req.SupplierID, Status: models.PurchaseOrderStatus(status), Note: utils.SanitizeRichText(req.Note), ShippingCents: req.ShippingCents, UserID: middleware.UserIDFrom(c)}
+			withTax(&tax, taxBase)
+			code, err := nextDocNumber(tx, companyOf(c), DocPurchaseOrder)
+			if err != nil {
+				return err
+			}
+			po := models.PurchaseOrder{Code: code, BranchID: req.BranchID, SupplierID: req.SupplierID, Status: models.PurchaseOrderStatus(status), Note: utils.SanitizeRichText(req.Note), ShippingCents: req.ShippingCents, TaxSnapshot: tax, UserID: middleware.UserIDFrom(c)}
 			if err := tx.Omit("Supplier", "Items").Create(&po).Error; err != nil {
 				return err
 			}
@@ -245,8 +270,15 @@ func (a *API) savePO(c *gin.Context, existingID uint64) {
 			if !canAccessBranch(c, po.BranchID) {
 				return utils.ErrForbidden
 			}
+			// An edit keeps the order's own tax rate as it was.
+			tax, err := a.taxRateFor(tx, companyOf(c), req.TaxRateID, po.TaxSnapshot)
+			if err != nil {
+				return err
+			}
+			withTax(&tax, taxBase)
 			if err := tx.Model(&po).Updates(map[string]interface{}{
 				"branch_id": req.BranchID, "supplier_id": req.SupplierID, "status": status, "note": utils.SanitizeRichText(req.Note), "shipping_cents": req.ShippingCents,
+				"tax_rate_id": tax.TaxRateID, "tax_name": tax.TaxName, "tax_percent": tax.TaxPercent, "tax_cents": tax.TaxCents,
 			}).Error; err != nil {
 				return err
 			}
@@ -287,6 +319,22 @@ func (a *API) savePO(c *gin.Context, existingID uint64) {
 	utils.OK(c, code, out[0])
 }
 
+// ownProducts refuses products that aren't the company's, answering 422 on
+// items.
+func (a *API) ownProducts(c *gin.Context, ids []uint64) bool {
+	ids = uniqueIDs(ids)
+	var n int64
+	if err := a.DB.Model(&models.Product{}).Where("id IN ? AND company_id = ?", ids, companyOf(c)).Count(&n).Error; err != nil {
+		dbFail(c, err)
+		return false
+	}
+	if n != int64(len(ids)) {
+		invalid(c, "items", "Product not found.")
+		return false
+	}
+	return true
+}
+
 func (a *API) CreatePurchaseOrder(c *gin.Context) { a.savePO(c, 0) }
 
 func (a *API) UpdatePurchaseOrder(c *gin.Context) {
@@ -305,6 +353,10 @@ func (a *API) DeletePurchaseOrder(c *gin.Context) {
 	var po models.PurchaseOrder
 	if err := a.DB.First(&po, id).Error; err != nil {
 		dbFail(c, err)
+		return
+	}
+	if !canAccessBranch(c, po.BranchID) {
+		fail(c, utils.ErrForbidden)
 		return
 	}
 	if po.Status == models.PurchaseOrderReceived || po.Status == models.PurchaseOrderPartial {
@@ -378,13 +430,13 @@ func (a *API) ReceivePurchaseOrder(c *gin.Context) {
 	out, _ := a.loadPOs(0, id)
 	if len(out) > 0 {
 		po := out[0]
-		total := po.ShippingCents
+		total := po.ShippingCents + po.TaxCents
 		itemLines := make([]string, len(po.Items))
 		for i, it := range po.Items {
-			total += it.QtyOrdered * it.UnitCostCents
+			total += it.QtyOrdered*it.UnitCostCents - it.DiscountCents
 			itemLines[i] = fmt.Sprintf("%d× %s", it.QtyOrdered, services.HTMLEscape(it.ProductName))
 		}
-		a.Notify.Send(services.AlertPOReceived, fmt.Sprintf(
+		a.Notify.Send(companyOf(c), services.AlertPOReceived, fmt.Sprintf(
 			"📦 <b>Purchase order received</b>\n%s · %s\n%s\nTotal: %s",
 			po.Code, services.HTMLEscape(po.SupplierName), services.FormatItemLines(itemLines, 12), services.FormatUSD(total),
 		))

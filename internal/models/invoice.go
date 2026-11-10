@@ -22,7 +22,7 @@ const (
 // migration 000024). It is separate from POS receipts (Sale).
 type Invoice struct {
 	ID                uint64               `gorm:"primaryKey" json:"id"`
-	Code              string               `gorm:"size:30;not null;uniqueIndex" json:"code"`
+	Code              string               `gorm:"size:30;not null" json:"code"` // unique within the branch
 	BranchID          uint64               `gorm:"not null" json:"branch_id"`
 	CustomerID        uint64               `gorm:"not null" json:"customer_id"`
 	InvoiceDate       time.Time            `gorm:"type:date;not null" json:"invoice_date"`
@@ -33,14 +33,16 @@ type Invoice struct {
 	LineDiscountCents int64                `gorm:"not null" json:"line_discount_cents"`
 	DiscountCents     int64                `gorm:"not null" json:"discount_cents"`
 	ShippingCents     int64                `gorm:"not null" json:"shipping_cents"`
-	TotalCents        int64                `gorm:"not null" json:"total_cents"`
-	PaidCents         int64                `gorm:"not null" json:"paid_cents"`
-	CostTotalCents    int64                `gorm:"not null" json:"cost_total_cents"`
-	ExchangeRate      int64                `gorm:"not null" json:"exchange_rate"`
-	Note              string               `gorm:"type:text;not null" json:"note"` // rich text (sanitised HTML)
-	CancelReason      string               `gorm:"size:255;not null" json:"cancel_reason"`
-	CancelledAt       *time.Time           `json:"cancelled_at"`
-	UserID            uint64               `gorm:"not null" json:"user_id"`
+	// Tax added on top of the lines after discounts plus shipping; TotalCents includes it.
+	TaxSnapshot    `gorm:"embedded"`
+	TotalCents     int64      `gorm:"not null" json:"total_cents"`
+	PaidCents      int64      `gorm:"not null" json:"paid_cents"`
+	CostTotalCents int64      `gorm:"not null" json:"cost_total_cents"`
+	ExchangeRate   int64      `gorm:"not null" json:"exchange_rate"`
+	Note           string     `gorm:"type:text;not null" json:"note"` // rich text (sanitised HTML)
+	CancelReason   string     `gorm:"size:255;not null" json:"cancel_reason"`
+	CancelledAt    *time.Time `json:"cancelled_at"`
+	UserID         uint64     `gorm:"not null" json:"user_id"`
 	Timestamps
 }
 

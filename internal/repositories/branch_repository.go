@@ -14,8 +14,8 @@ func NewBranchRepository(db *gorm.DB) *BranchRepository {
 	return &BranchRepository{db: db}
 }
 
-// AllActiveIDs returns every active branch ID — used to grant Owner-role
-// tokens access to all branches without special-casing "is Owner" in
+// AllActiveIDs returns every active branch ID — used to grant an Owner's
+// session access to all branches without special-casing "is Owner" in
 // downstream branch-scope checks (see middleware/branch_scope.go).
 func (r *BranchRepository) AllActiveIDs() ([]uint64, error) {
 	var ids []uint64

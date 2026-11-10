@@ -17,24 +17,45 @@ type Dependencies struct {
 	Config      *config.Config
 	AuthHandler *handlers.AuthHandler
 	API         *handlers.API
+	// PrincipalLoader defaults to API.LoadPrincipal.
+	PrincipalLoader middleware.PrincipalLoader
 }
+
+const (
+	// A JSON API with a few base64 images in it. Anything bigger is refused
+	// before it's read.
+	maxBodyBytes = 10 << 20
+	// Sign-in and the QR ordering endpoints are public and take small bodies.
+	maxPublicBodyBytes = 64 << 10
+)
 
 func Setup(deps Dependencies) *gin.Engine {
 	if deps.Config.IsProduction() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	// A permission granted after someone signed in works straight away (see
-	// middleware.LivePermissions), not only after they sign out and in.
-	middleware.LivePermissions = deps.API.CurrentPermissions
+	loadPrincipal := deps.PrincipalLoader
+	if loadPrincipal == nil {
+		loadPrincipal = deps.API.LoadPrincipal
+	}
+	requireAuth := middleware.RequireAuth(deps.Config.JWTAccessSecret, loadPrincipal)
 
 	r := gin.New()
+	// Forwarded headers are never believed by default: anyone can send them,
+	// and limits keyed on a spoofed address don't limit anything. A deployment
+	// behind a proxy that sets a trustworthy header names it in CLIENT_IP_HEADER.
+	if err := r.SetTrustedProxies(nil); err != nil {
+		panic(err)
+	}
+	r.TrustedPlatform = deps.Config.ClientIPHeader
+
 	r.Use(gin.Recovery())
 	r.Use(middleware.RequestID())
+	r.Use(middleware.SecurityHeaders(deps.Config.IsProduction()))
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     deps.Config.CORSAllowedOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Request-Id"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Request-Id", middleware.BranchHeader},
 		ExposeHeaders:    []string{"X-Request-Id"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
@@ -42,15 +63,21 @@ func Setup(deps Dependencies) *gin.Engine {
 
 	r.GET("/healthz", handlers.Health)
 
+	// Per client address, on top of the per-account lockout. Refreshing gets
+	// twice the room: every open tab and till does it on its own schedule.
+	signInLimit := middleware.RateLimit(deps.Config.AuthRateLimitPerMinute)
+	sessionLimit := middleware.RateLimit(deps.Config.AuthRateLimitPerMinute * 2)
+
 	v1 := r.Group("/api/v1")
 	{
 		auth := v1.Group("/auth")
+		auth.Use(middleware.MaxBodySize(maxPublicBodyBytes))
 		{
-			auth.POST("/login", deps.AuthHandler.Login)
-			auth.POST("/pin-login", deps.AuthHandler.PINLogin)
-			auth.POST("/refresh", deps.AuthHandler.Refresh)
-			auth.POST("/logout", deps.AuthHandler.Logout)
-			auth.GET("/me", middleware.RequireAuth(deps.Config.JWTAccessSecret), deps.AuthHandler.Me)
+			auth.POST("/login", signInLimit, deps.AuthHandler.Login)
+			auth.POST("/pin-login", signInLimit, deps.AuthHandler.PINLogin)
+			auth.POST("/refresh", sessionLimit, deps.AuthHandler.Refresh)
+			auth.POST("/logout", sessionLimit, deps.AuthHandler.Logout)
+			auth.GET("/me", requireAuth, deps.AuthHandler.Me)
 			// The POS sign-in screen lists tills before anyone is signed in.
 			auth.GET("/tills", deps.API.PublicTills)
 			// Company name + logo, shown on the sign-in pages too.
@@ -60,6 +87,7 @@ func Setup(deps Dependencies) *gin.Engine {
 		// QR table ordering: the customer's phone has no account. The table
 		// token in the QR is the access check (see handlers/table_orders.go).
 		public := v1.Group("/public")
+		public.Use(middleware.MaxBodySize(maxPublicBodyBytes))
 		{
 			public.GET("/tables/:token/menu", deps.API.PublicTableMenu)
 			public.POST("/tables/:token/orders", deps.API.PlacePublicTableOrder)
@@ -69,113 +97,111 @@ func Setup(deps Dependencies) *gin.Engine {
 
 	api := deps.API
 	authed := v1.Group("")
-	authed.Use(middleware.RequireAuth(deps.Config.JWTAccessSecret), middleware.BranchScope())
+	// Everything here is one company's data: a super admin (no company) is
+	// refused, and every handler filters by the caller's company.
+	authed.Use(middleware.MaxBodySize(maxBodyBytes), requireAuth, middleware.RequireCompany(), middleware.BranchScope())
 	{
 		perm := middleware.RequirePermission
 		anyPerm := middleware.RequireAnyPermission
-		catalogWrite := anyPerm("inventory.adjust", "inventory.edit_price")
-		// Products get their own create/edit split (categories and
-		// suppliers keep the general catalogWrite gate above).
-		productCreate := perm("inventory.product_create")
-		productEdit := perm("inventory.product_edit")
-
 		// Reference data & settings
 		authed.GET("/branches", api.ListBranches)
-		authed.POST("/branches", perm("branch.manage"), api.CreateBranch)
-		authed.PUT("/branches/:id", perm("branch.manage"), api.UpdateBranch)
-		authed.DELETE("/branches/:id", perm("branch.manage"), api.DeleteBranch)
+		authed.POST("/branches", perm("branch.create"), api.CreateBranch)
+		authed.PUT("/branches/:id", perm("branch.update"), api.UpdateBranch)
+		authed.DELETE("/branches/:id", perm("branch.delete"), api.DeleteBranch)
 
-		authed.GET("/devices", perm("branch.manage"), api.ListDevices)
-		authed.POST("/devices", perm("branch.manage"), api.CreateDevice)
-		authed.PUT("/devices/:id", perm("branch.manage"), api.UpdateDevice)
-		authed.DELETE("/devices/:id", perm("branch.manage"), api.DeleteDevice)
+		authed.GET("/devices", perm("branch.view"), api.ListDevices)
+		authed.POST("/devices", perm("branch.create"), api.CreateDevice)
+		authed.PUT("/devices/:id", perm("branch.update"), api.UpdateDevice)
+		authed.DELETE("/devices/:id", perm("branch.delete"), api.DeleteDevice)
 
-		authed.GET("/dining-tables", perm("branch.manage"), api.ListDiningTables)
-		authed.POST("/dining-tables", perm("branch.manage"), api.CreateDiningTable)
-		authed.POST("/dining-tables/bulk", perm("branch.manage"), api.CreateDiningTablesBulk)
-		authed.PUT("/dining-tables/:id", perm("branch.manage"), api.UpdateDiningTable)
-		authed.DELETE("/dining-tables/:id", perm("branch.manage"), api.DeleteDiningTable)
+		authed.GET("/dining-tables", perm("table.view"), api.ListDiningTables)
+		authed.POST("/dining-tables", perm("table.create"), api.CreateDiningTable)
+		authed.POST("/dining-tables/bulk", perm("table.create"), api.CreateDiningTablesBulk)
+		authed.PUT("/dining-tables/:id", perm("table.update"), api.UpdateDiningTable)
+		authed.DELETE("/dining-tables/:id", perm("table.delete"), api.DeleteDiningTable)
 
 		authed.GET("/payment-methods", api.ListPaymentMethods)
-		authed.POST("/payment-methods", perm("branch.manage"), api.CreatePaymentMethod)
-		authed.PUT("/payment-methods/:id", perm("branch.manage"), api.UpdatePaymentMethod)
-		authed.DELETE("/payment-methods/:id", perm("branch.manage"), api.DeletePaymentMethod)
+		authed.POST("/payment-methods", perm("payment_method.create"), api.CreatePaymentMethod)
+		authed.PUT("/payment-methods/:id", perm("payment_method.update"), api.UpdatePaymentMethod)
+		authed.DELETE("/payment-methods/:id", perm("payment_method.delete"), api.DeletePaymentMethod)
+
+		// Tax rates: everyone reads them (the till and the forms pick from
+		// them); changing them, and where each place starts, is tax_rate.*.
+		authed.GET("/tax-rates", api.ListTaxRates)
+		authed.POST("/tax-rates", perm("tax_rate.create"), api.CreateTaxRate)
+		authed.PUT("/tax-rates/defaults", perm("tax_rate.update"), api.UpdateTaxDefaults)
+		authed.PUT("/tax-rates/:id", perm("tax_rate.update"), api.UpdateTaxRate)
+		authed.DELETE("/tax-rates/:id", perm("tax_rate.delete"), api.DeleteTaxRate)
 
 		authed.GET("/settings", api.GetSettings)
-		authed.PUT("/settings", perm("branch.manage"), api.UpdateSettings)
-		authed.PUT("/settings/branding", perm("branch.manage"), api.UpdateBranding)
+		authed.PUT("/settings", perm("settings.company"), api.UpdateSettings)
+		authed.PUT("/settings/branding", perm("settings.company"), api.UpdateBranding)
 		authed.GET("/exchange-rate", api.GetExchangeRate)
 		authed.POST("/exchange-rate", perm("settings.rate"), api.SetExchangeRate)
 
-		// Telegram alerts & database backups (Settings > Alerts & Backup) —
-		// Owner-only by default, same standing as branch.manage.
+		// The company's Telegram alerts and numbering (Settings > System) —
+		// Owner-only by default. The company
+		// reads how long it keeps its activity log; the super admin sets it.
+		// Backups and the production reset cover every company, so they're
+		// the super admin's (see /platform below).
 		system := perm("system.manage")
 		authed.GET("/settings/notifications", system, api.GetNotifySettings)
 		authed.PUT("/settings/notifications", system, api.UpdateNotifySettings)
 		authed.POST("/settings/notifications/test", system, api.SendTestAlert)
-		authed.GET("/backups", system, api.ListBackups)
-		authed.PUT("/backups/settings", system, api.UpdateBackupSettings)
-		authed.POST("/backups/run", system, api.RunBackupNow)
-		authed.GET("/backups/:id/download", system, api.DownloadBackup)
-		authed.DELETE("/backups/:id", system, api.DeleteBackup)
 		authed.GET("/settings/numbering", system, api.GetNumberSequences)
 		authed.PUT("/settings/numbering", system, api.UpdateNumberSequence)
 		authed.GET("/settings/activity-log-retention", system, api.GetActivityLogRetention)
-		authed.PUT("/settings/activity-log-retention", system, api.UpdateActivityLogRetention)
-		authed.POST("/settings/activity-log-retention/clear", system, api.ClearActivityLogNow)
 		authed.PUT("/settings/stock-policy", system, api.UpdateStockPolicy)
 
-		// Its own permission, deliberately separate from system.manage — see
-		// system_reset.go's doc comment.
-		authed.POST("/system/reset-for-production", perm("system.reset"), api.ResetForProduction)
-
 		// Catalog
-		authed.GET("/categories", perm("inventory.view"), api.ListCategories)
-		authed.POST("/categories", catalogWrite, api.CreateCategory)
-		authed.PUT("/categories/:id", catalogWrite, api.UpdateCategory)
-		authed.DELETE("/categories/:id", catalogWrite, api.DeleteCategory)
-		authed.POST("/categories/import", catalogWrite, api.ImportCategories)
+		authed.GET("/categories", perm("category.view"), api.ListCategories)
+		authed.POST("/categories", perm("category.create"), api.CreateCategory)
+		authed.PUT("/categories/:id", perm("category.update"), api.UpdateCategory)
+		authed.DELETE("/categories/:id", perm("category.delete"), api.DeleteCategory)
+		authed.POST("/categories/import", perm("category.create"), api.ImportCategories)
 
-		authed.GET("/suppliers", perm("inventory.view"), api.ListSuppliers)
-		authed.POST("/suppliers", catalogWrite, api.CreateSupplier)
-		authed.PUT("/suppliers/:id", catalogWrite, api.UpdateSupplier)
-		authed.DELETE("/suppliers/:id", catalogWrite, api.DeleteSupplier)
+		authed.GET("/suppliers", perm("supplier.view"), api.ListSuppliers)
+		authed.POST("/suppliers", perm("supplier.create"), api.CreateSupplier)
+		authed.PUT("/suppliers/:id", perm("supplier.update"), api.UpdateSupplier)
+		authed.DELETE("/suppliers/:id", perm("supplier.delete"), api.DeleteSupplier)
 
-		authed.GET("/products", perm("inventory.view"), api.ListProducts)
-		authed.POST("/products", productCreate, api.CreateProduct)
-		authed.PUT("/products/:id", productEdit, api.UpdateProduct)
-		authed.DELETE("/products/:id", productEdit, api.DeleteProduct)
-		authed.POST("/products/import", productCreate, api.ImportProducts)
+		authed.GET("/products", perm("product.view"), api.ListProducts)
+		authed.POST("/products", perm("product.create"), api.CreateProduct)
+		authed.PUT("/products/:id", perm("product.update"), api.UpdateProduct)
+		authed.DELETE("/products/:id", perm("product.delete"), api.DeleteProduct)
+		authed.POST("/products/import", perm("product.create"), api.ImportProducts)
 
 		authed.GET("/stock-movements", perm("inventory.view"), api.ListStockMovements)
 
-		authed.GET("/purchase-orders", perm("inventory.view"), api.ListPurchaseOrders)
-		authed.POST("/purchase-orders", perm("inventory.purchase_order"), api.CreatePurchaseOrder)
-		authed.PUT("/purchase-orders/:id", perm("inventory.purchase_order"), api.UpdatePurchaseOrder)
-		authed.DELETE("/purchase-orders/:id", perm("inventory.purchase_order"), api.DeletePurchaseOrder)
-		authed.POST("/purchase-orders/:id/receive", perm("inventory.receive"), api.ReceivePurchaseOrder)
+		authed.GET("/purchase-orders", perm("purchase_order.view"), api.ListPurchaseOrders)
+		authed.POST("/purchase-orders", perm("purchase_order.create"), api.CreatePurchaseOrder)
+		authed.PUT("/purchase-orders/:id", perm("purchase_order.update"), api.UpdatePurchaseOrder)
+		authed.DELETE("/purchase-orders/:id", perm("purchase_order.delete"), api.DeletePurchaseOrder)
+		authed.POST("/purchase-orders/:id/receive", perm("purchase_order.receive"), api.ReceivePurchaseOrder)
 
 		// People
 		authed.GET("/customers", perm("customer.view"), api.ListCustomers)
-		authed.POST("/customers", perm("customer.manage"), api.CreateCustomer)
-		authed.PUT("/customers/:id", perm("customer.manage"), api.UpdateCustomer)
-		authed.DELETE("/customers/:id", perm("customer.manage"), api.DeleteCustomer)
+		authed.POST("/customers", perm("customer.create"), api.CreateCustomer)
+		authed.PUT("/customers/:id", perm("customer.update"), api.UpdateCustomer)
+		authed.DELETE("/customers/:id", perm("customer.delete"), api.DeleteCustomer)
+		authed.PUT("/settings/default-customer", perm("customer.update"), api.UpdateDefaultCustomer)
 
-		authed.GET("/expenses", perm("expense.manage"), api.ListExpenses)
-		authed.POST("/expenses", perm("expense.manage"), api.CreateExpense)
-		authed.PUT("/expenses/:id", perm("expense.manage"), api.UpdateExpense)
-		authed.DELETE("/expenses/:id", perm("expense.manage"), api.DeleteExpense)
+		authed.GET("/expenses", perm("expense.view"), api.ListExpenses)
+		authed.POST("/expenses", perm("expense.create"), api.CreateExpense)
+		authed.PUT("/expenses/:id", perm("expense.update"), api.UpdateExpense)
+		authed.DELETE("/expenses/:id", perm("expense.delete"), api.DeleteExpense)
 
-		authed.GET("/users", anyPerm("user.manage", "role.manage"), api.ListUsers)
-		authed.POST("/users", perm("user.manage"), api.CreateUser)
-		authed.PUT("/users/:id", perm("user.manage"), api.UpdateUser)
-		authed.DELETE("/users/:id", perm("user.manage"), api.DeleteUser)
-		authed.POST("/users/:id/reset-pin", perm("user.manage"), api.ResetUserPIN)
-		authed.GET("/roles", anyPerm("user.manage", "role.manage"), api.ListRoles)
-		authed.GET("/permissions", anyPerm("user.manage", "role.manage"), api.ListPermissions)
-		authed.POST("/roles", perm("role.manage"), api.CreateRole)
-		authed.PUT("/roles/:id", perm("role.manage"), api.UpdateRole)
-		authed.DELETE("/roles/:id", perm("role.manage"), api.DeleteRole)
+		authed.GET("/users", anyPerm("user.view", "role.view"), api.ListUsers)
+		authed.GET("/users/:id", anyPerm("user.view", "role.view"), api.GetUser)
+		authed.POST("/users", perm("user.create"), api.CreateUser)
+		authed.PUT("/users/:id", perm("user.update"), api.UpdateUser)
+		authed.DELETE("/users/:id", perm("user.delete"), api.DeleteUser)
+		authed.POST("/users/:id/reset-pin", perm("user.update"), api.ResetUserPIN)
+		authed.GET("/roles", anyPerm("user.view", "role.view"), api.ListRoles)
+		authed.GET("/permissions", anyPerm("user.view", "role.view"), api.ListPermissions)
+		authed.POST("/roles", perm("role.create"), api.CreateRole)
+		authed.PUT("/roles/:id", perm("role.update"), api.UpdateRole)
+		authed.DELETE("/roles/:id", perm("role.delete"), api.DeleteRole)
 
 		// Shifts & sales
 		authed.GET("/shifts/current", perm("shift.own"), api.GetCurrentShift)
@@ -190,14 +216,13 @@ func Setup(deps Dependencies) *gin.Engine {
 		authed.PUT("/sales/:id", perm("pos.edit_sale"), api.EditSale)
 		authed.POST("/sales/:id/void", perm("pos.void"), api.VoidSale)
 		// Back-office sales (invoices) — see handlers/invoices.go
-		invoices := perm("invoice.manage")
-		authed.GET("/invoices", anyPerm("invoice.manage", "report.sales"), api.ListInvoices)
-		authed.GET("/invoices/:id", anyPerm("invoice.manage", "report.sales"), api.GetInvoice)
-		authed.POST("/invoices", invoices, api.CreateInvoice)
-		authed.PUT("/invoices/:id", invoices, api.UpdateInvoice)
-		authed.POST("/invoices/:id/cancel", invoices, api.CancelInvoice)
-		authed.POST("/invoices/:id/payments", invoices, api.AddInvoicePayment)
-		authed.DELETE("/invoices/:id/payments/:paymentId", invoices, api.DeleteInvoicePayment)
+		authed.GET("/invoices", perm("invoice.view"), api.ListInvoices)
+		authed.GET("/invoices/:id", perm("invoice.view"), api.GetInvoice)
+		authed.POST("/invoices", perm("invoice.create"), api.CreateInvoice)
+		authed.PUT("/invoices/:id", perm("invoice.update"), api.UpdateInvoice)
+		authed.POST("/invoices/:id/payments", perm("invoice.update"), api.AddInvoicePayment)
+		authed.POST("/invoices/:id/cancel", perm("invoice.delete"), api.CancelInvoice)
+		authed.DELETE("/invoices/:id/payments/:paymentId", perm("invoice.delete"), api.DeleteInvoicePayment)
 
 		authed.GET("/table-orders", anyPerm("pos.sell", "report.sales"), api.ListTableOrders)
 		authed.GET("/table-board", anyPerm("pos.sell", "report.sales"), api.ListTableBoard)
@@ -220,6 +245,34 @@ func Setup(deps Dependencies) *gin.Engine {
 			rep.GET("/profit-loss", perm("report.profit_loss"), api.ProfitLoss)
 			rep.GET("/activity-log", perm("report.activity_log"), api.ActivityLogReport)
 		}
+	}
+
+	// The super admin's: the companies themselves and the tools that cover
+	// every company at once. No company user reaches these, the Owner neither.
+	platform := v1.Group("/platform")
+	platform.Use(middleware.MaxBodySize(maxBodyBytes), requireAuth, middleware.RequireSuperAdmin())
+	{
+		platform.GET("/companies", api.ListCompanies)
+		platform.POST("/companies", api.CreateCompany)
+		platform.PUT("/companies/:id", api.UpdateCompany)
+		platform.POST("/companies/:id/owner", api.SetCompanyOwner)
+		platform.POST("/companies/:id/activity-log/clear", api.ClearCompanyActivityLog)
+		platform.GET("/companies/:id/branches", api.ListCompanyBranches)
+		platform.PUT("/companies/:id/branches/:branch_id", api.SetCompanyBranchActive)
+		platform.GET("/companies/:id/users", api.ListCompanyUsers)
+		platform.PUT("/companies/:id/users/:user_id", api.SetCompanyUserActive)
+
+		platform.GET("/settings/notifications", api.GetPlatformNotifySettings)
+		platform.PUT("/settings/notifications", api.UpdatePlatformNotifySettings)
+		platform.POST("/settings/notifications/test", api.SendTestAlert)
+
+		platform.GET("/backups", api.ListBackups)
+		platform.PUT("/backups/settings", api.UpdateBackupSettings)
+		platform.POST("/backups/run", api.RunBackupNow)
+		platform.GET("/backups/:id/download", api.DownloadBackup)
+		platform.DELETE("/backups/:id", api.DeleteBackup)
+
+		platform.POST("/reset-for-production", api.ResetForProduction)
 	}
 
 	return r

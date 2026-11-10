@@ -17,15 +17,17 @@ const (
 )
 
 type Expense struct {
-	ID            uint64          `gorm:"primaryKey" json:"id"`
-	Code          string          `gorm:"size:30;not null" json:"code"`
-	BranchID      uint64          `gorm:"not null;index" json:"branch_id"`
-	Category      ExpenseCategory `gorm:"size:20;not null;index" json:"category"`
-	AmountCents   int64           `gorm:"not null" json:"amount_cents"`
-	ExpenseDate   time.Time       `gorm:"type:date;not null;index" json:"expense_date"`
-	Note          string          `gorm:"size:255" json:"note"`
-	UserID        uint64          `gorm:"not null" json:"user_id"`
-	AttachmentURL string          `gorm:"size:500" json:"attachment_url"`
+	ID          uint64          `gorm:"primaryKey" json:"id"`
+	Code        string          `gorm:"size:30;not null" json:"code"`
+	BranchID    uint64          `gorm:"not null;index" json:"branch_id"`
+	Category    ExpenseCategory `gorm:"size:20;not null;index" json:"category"`
+	AmountCents int64           `gorm:"not null" json:"amount_cents"` // before tax
+	// Tax on top of AmountCents; what was paid is the two together.
+	TaxSnapshot   `gorm:"embedded"`
+	ExpenseDate   time.Time `gorm:"type:date;not null;index" json:"expense_date"`
+	Note          string    `gorm:"type:text;not null" json:"note"` // rich text (sanitised HTML)
+	UserID        uint64    `gorm:"not null" json:"user_id"`
+	AttachmentURL string    `gorm:"size:500" json:"attachment_url"`
 	Timestamps
 	SoftDelete
 }

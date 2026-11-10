@@ -2,10 +2,23 @@ package models
 
 import "time"
 
+// RoleOwner is the name of each company's locked role that has every
+// permission and implicit access to every branch of that company.
+const RoleOwner = "Owner"
+
+// RoleSuperAdmin is the name of the one locked role with no company: its
+// holders manage companies, backups and resets, and see no company data.
+const RoleSuperAdmin = "Super admin"
+
 type Role struct {
-	ID          uint64 `gorm:"primaryKey" json:"id"`
-	Name        string `gorm:"size:60;not null;uniqueIndex" json:"name"`
-	Description string `gorm:"size:255" json:"description"`
+	ID uint64 `gorm:"primaryKey" json:"id"`
+	// CompanyID is nil only for the super admin (and their role).
+	CompanyID   *uint64 `gorm:"index" json:"-"`
+	Name        string  `gorm:"size:60;not null" json:"name"` // unique within the company
+	Description string  `gorm:"size:255" json:"description"`
+	// BranchID is the branch the role belongs to; nil means it's shared by
+	// every branch. A branch's role can only be held at that branch.
+	BranchID *uint64 `gorm:"index" json:"branch_id"`
 	// IsLocked marks the seeded Owner role: cannot be edited or deleted.
 	IsLocked bool `gorm:"not null;default:false" json:"is_locked"`
 	Timestamps
@@ -17,7 +30,7 @@ type Role struct {
 
 func (Role) TableName() string { return "roles" }
 
-// Permission is a single grantable key, e.g. "pos.sell", "inventory.receive".
+// Permission is a single grantable key, e.g. "pos.sell", "product.create".
 type Permission struct {
 	ID          uint64 `gorm:"primaryKey" json:"id"`
 	Key         string `gorm:"size:60;not null;uniqueIndex" json:"key"`
@@ -47,14 +60,19 @@ type RoleLimit struct {
 func (RoleLimit) TableName() string { return "role_limits" }
 
 type User struct {
-	ID          uint64  `gorm:"primaryKey" json:"id"`
-	FullName    string  `gorm:"size:120;not null" json:"full_name"`
-	Username    string  `gorm:"size:60;not null;uniqueIndex" json:"username"`
-	Phone       string  `gorm:"size:30" json:"phone"`
-	PasswordHash string `gorm:"size:255;not null" json:"-"`
-	PINHash     *string `gorm:"size:255" json:"-"`
-	RoleID      uint64  `gorm:"not null;index" json:"role_id"`
-	Active      bool    `gorm:"not null" json:"active"` // see note on models.Branch.Active
+	ID uint64 `gorm:"primaryKey" json:"id"`
+	// CompanyID is nil only for the super admin (and their role).
+	CompanyID    *uint64 `gorm:"index" json:"-"`
+	FullName     string  `gorm:"size:120;not null" json:"full_name"`
+	Username     string  `gorm:"size:60;not null;uniqueIndex" json:"username"`
+	Phone        string  `gorm:"size:30" json:"phone"`
+	PasswordHash string  `gorm:"size:255;not null" json:"-"`
+	PINHash      *string `gorm:"size:255" json:"-"`
+	RoleID       uint64  `gorm:"not null;index" json:"role_id"`
+	Active       bool    `gorm:"not null" json:"active"` // see note on models.Branch.Active
+	// TokenVersion is checked against the access token on every request;
+	// bumping it ends every access token already issued to this user.
+	TokenVersion uint64     `gorm:"not null;default:0" json:"-"`
 	LastActiveAt *time.Time `json:"last_active_at,omitempty"`
 	Timestamps
 	SoftDelete
@@ -69,6 +87,9 @@ func (User) TableName() string { return "users" }
 type UserBranch struct {
 	UserID   uint64 `gorm:"primaryKey" json:"user_id"`
 	BranchID uint64 `gorm:"primaryKey" json:"branch_id"`
+	// RoleID is the role they hold at this branch when it isn't their main
+	// role (User.RoleID). nil means the main role applies here.
+	RoleID *uint64 `json:"role_id"`
 }
 
 func (UserBranch) TableName() string { return "user_branches" }
@@ -76,9 +97,11 @@ func (UserBranch) TableName() string { return "user_branches" }
 // RefreshToken stores refresh tokens hashed (never the raw token), and is
 // rotated (old row invalidated, new row inserted) on every /auth/refresh.
 type RefreshToken struct {
-	ID        uint64     `gorm:"primaryKey" json:"id"`
-	UserID    uint64     `gorm:"not null;index" json:"user_id"`
-	TokenHash string     `gorm:"size:64;not null;uniqueIndex" json:"-"`
+	ID        uint64 `gorm:"primaryKey" json:"id"`
+	UserID    uint64 `gorm:"not null;index" json:"user_id"`
+	TokenHash string `gorm:"size:64;not null;uniqueIndex" json:"-"`
+	// FamilyID is shared by every token rotated from the same login.
+	FamilyID  string     `gorm:"size:36;not null;index" json:"-"`
 	DeviceID  *uint64    `gorm:"index" json:"device_id,omitempty"`
 	ExpiresAt time.Time  `gorm:"not null;index" json:"expires_at"`
 	RevokedAt *time.Time `json:"revoked_at,omitempty"`
@@ -89,9 +112,11 @@ type RefreshToken struct {
 
 func (RefreshToken) TableName() string { return "refresh_tokens" }
 
-// LoginAttempt backs the login/PIN lockout rule (5 fails -> 5 minute lock
-// per user+device). Not in the original table list (build spec §6); added
-// because durable lockout tracking needs a table — see docs/DECISIONS.md.
+// LoginAttempt backs the login/PIN lockout rule (5 fails -> 5 minute lock per
+// user, across every till, plus a daily cap on PIN failures). DeviceID records
+// which till a failure came from; it doesn't narrow the count. Not in the
+// original table list (build spec §6); added because durable lockout tracking
+// needs a table — see docs/DECISIONS.md.
 type LoginAttempt struct {
 	ID        uint64    `gorm:"primaryKey" json:"id"`
 	UserID    uint64    `gorm:"not null;index:idx_login_attempts_user_device" json:"user_id"`

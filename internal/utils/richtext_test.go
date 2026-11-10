@@ -29,3 +29,20 @@ func TestSanitizeRichText(t *testing.T) {
 		t.Errorf("safe link not kept as expected: %q", link)
 	}
 }
+
+func TestRichTextPlain(t *testing.T) {
+	cases := map[string]string{
+		"<p>Paid <strong>cash</strong> &amp; got a receipt</p>": "Paid cash & got a receipt",
+		"<p>one</p><p></p><p>two<br>three</p>":                  "one\ntwo\nthree",
+		"<ul><li><p>gas</p></li><li>water</li></ul>":            "• gas\n• water",
+		"<p>a</p><script>alert(1)</script>":                     "a",
+		"plain   old\tnote, a < b":                              "plain old note, a < b",
+		"<p>  </p>":                                             "",
+		"":                                                      "",
+	}
+	for in, want := range cases {
+		if got := RichTextPlain(in); got != want {
+			t.Errorf("RichTextPlain(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

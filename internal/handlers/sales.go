@@ -51,11 +51,17 @@ type saleDTO struct {
 	ShiftStatus   string         `json:"shift_status"`
 	SubtotalCents int64          `json:"subtotal_cents"`
 	DiscountCents int64          `json:"discount_cents"`
+	TaxRateID     *uint64        `json:"tax_rate_id"`
+	TaxName       string         `json:"tax_name"`
+	TaxPercent    float64        `json:"tax_percent"`
+	TaxCents      int64          `json:"tax_cents"` // on top of the discounted amount; in TotalCents
 	TotalCents    int64          `json:"total_cents"`
 	TotalRiel     int64          `json:"total_riel"`
+	ExchangeRate  int64          `json:"exchange_rate"` // the sale's own rate; an edit keeps it
 	PointsEarned  int64          `json:"points_earned"`
 	SoldAt        time.Time      `json:"sold_at"`
 	VoidReason    string         `json:"void_reason,omitempty"`
+	Note          string         `json:"note"` // rich text (sanitised HTML)
 	Items         []saleItemDTO  `json:"items" gorm:"-"`
 	Payment       salePaymentDTO `json:"payment" gorm:"-"`
 }
@@ -79,7 +85,8 @@ func (a *API) loadSalesPage(pg pager, where string, args ...interface{}) ([]sale
 	}
 	q := a.DB.Table("sales s").
 		Select(`s.id, s.receipt_no, s.shift_id, s.branch_id, COALESCE(u.full_name,'') AS cashier, s.customer_id,
-			COALESCE(cu.name,'') AS customer_name, COALESCE(sh.status,'') AS shift_status, s.status, s.subtotal_cents, s.discount_cents, s.total_cents, s.total_riel, s.sold_at`).
+			COALESCE(cu.name,'') AS customer_name, COALESCE(sh.status,'') AS shift_status, s.status, s.subtotal_cents, s.discount_cents, s.total_cents, s.total_riel, s.exchange_rate, s.sold_at,
+			s.tax_rate_id, s.tax_name, s.tax_percent, s.tax_cents, s.note`).
 		Joins("LEFT JOIN users u ON u.id = s.cashier_id").
 		Joins("LEFT JOIN customers cu ON cu.id = s.customer_id").
 		Joins("LEFT JOIN shifts sh ON sh.id = s.shift_id").
@@ -244,6 +251,11 @@ type createSaleReq struct {
 	// bill. Each is marked PAID in the same transaction, or the sale fails.
 	TableOrderID  *uint64  `json:"table_order_id"`
 	TableOrderIDs []uint64 `json:"table_order_ids" binding:"max=50"`
+	// An optional tax rate added on top of the discounted amount (see
+	// tax_rates.go); none is no tax.
+	TaxRateID *uint64 `json:"tax_rate_id"`
+	// The sale's own note: rich text, sanitised on save.
+	Note string `json:"note" binding:"max=20000"`
 }
 
 // tableOrderIDs is every table order this sale pays, without duplicates and
@@ -274,6 +286,8 @@ func (a *API) roleMaxDiscountPercent(c *gin.Context) int {
 	return limit.MaxDiscountPercent
 }
 
+var errIdempotencyKeyConflict = utils.NewAppError(http.StatusConflict, "IDEMPOTENCY_KEY_CONFLICT", "This sale's reference is already in use. Please try again.")
+
 func roleIDFrom(c *gin.Context) uint64 {
 	v, _ := c.Get(middleware.CtxRoleID)
 	id, _ := v.(uint64)
@@ -294,6 +308,12 @@ func (a *API) CreateSale(c *gin.Context) {
 	userID := middleware.UserIDFrom(c)
 
 	if prior, err := a.loadSales("s.idempotency_key = ?", req.IdempotencyKey); err == nil && len(prior) > 0 {
+		// The key is chosen by the client, so it can't be what lets someone
+		// read a receipt from a branch they have no access to.
+		if !canAccessBranch(c, prior[0].BranchID) {
+			fail(c, errIdempotencyKeyConflict)
+			return
+		}
 		utils.OK(c, http.StatusOK, prior[0])
 		return
 	}
@@ -311,18 +331,33 @@ func (a *API) CreateSale(c *gin.Context) {
 		return
 	}
 
-	rate := a.currentRate()
-	appSettings := a.loadSettings()
+	if req.CustomerID != nil && !a.companyOwns(c, &models.Customer{}, *req.CustomerID) {
+		invalid(c, "customer_id", "Customer not found.")
+		return
+	}
+	rate := a.currentRate(companyOf(c))
+	appSettings := a.loadSettings(companyOf(c))
 	loyaltyRate := appSettings.LoyaltyPointsPerUSD
 	// Store-wide, not per-product (see docs/DECISIONS.md) — read once here,
 	// same as the rate and loyalty settings above, rather than per line.
 	allowOOS := appSettings.AllowOutOfStockSale
+	// The tax rate is checked before anything is written (see tax_rates.go).
+	taxSnap, err := a.taxRateFor(a.DB, companyOf(c), req.TaxRateID, models.TaxSnapshot{})
+	if err != nil {
+		fail(c, err)
+		return
+	}
 	var saleID uint64
 	// Collected during the transaction, alerted on after it commits (an
 	// alert must never depend on / block a rollback-able DB call).
 	var lowStock []lowStockHit
 
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		// The shift could have been closed since it was looked up above; a
+		// sale must never land in a closed shift (its cash count is done).
+		if _, err := lockShiftOpen(tx, shift.ID, "This shift has just been closed. Open a new shift to keep selling."); err != nil {
+			return err
+		}
 		var subtotal, lineDiscounts, cost int64
 		lines := make([]models.SaleItem, 0, len(req.Items))
 		serviceItems := map[uint64]bool{} // product_id -> true, for skipping stock movements below
@@ -353,7 +388,7 @@ func (a *API) CreateSale(c *gin.Context) {
 				Joins(`LEFT JOIN product_prices pp ON pp.id = (
 					SELECT x.id FROM product_prices x WHERE x.product_id = p.id AND (x.branch_id IS NULL OR x.branch_id = ?)
 					ORDER BY (x.branch_id IS NULL), x.effective_at DESC, x.id DESC LIMIT 1)`, device.BranchID).
-				Where("p.id = ? AND p.deleted_at IS NULL", pid).Scan(&prod).Error
+				Where("p.id = ? AND p.company_id = ? AND p.deleted_at IS NULL", pid, companyOf(c)).Scan(&prod).Error
 			if err != nil {
 				return err
 			}
@@ -399,6 +434,7 @@ func (a *API) CreateSale(c *gin.Context) {
 		}
 		totalDiscount := lineDiscounts + cartDiscount
 		total := afterLines - cartDiscount
+		total += withTax(&taxSnap, total) // tax on top of the discounted amount
 
 		if totalDiscount > 0 {
 			if !hasPerm(c, "pos.discount") {
@@ -424,7 +460,7 @@ func (a *API) CreateSale(c *gin.Context) {
 
 		now := time.Now()
 		businessDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
-		receiptNo, err := nextDocNumber(tx, DocSale)
+		receiptNo, err := nextDocNumber(tx, companyOf(c), DocSale)
 		if err != nil {
 			return err
 		}
@@ -433,6 +469,7 @@ func (a *API) CreateSale(c *gin.Context) {
 			ReceiptNo: receiptNo, BusinessDate: businessDate, Status: models.SalePaid,
 			SubtotalCents: subtotal, DiscountCents: totalDiscount, TotalCents: total, TotalRiel: utils.USDCentsToRiel(total, rate),
 			ExchangeRate: rate, CostTotalCents: cost, IdempotencyKey: req.IdempotencyKey, SoldAt: now,
+			TaxSnapshot: taxSnap, Note: utils.SanitizeRichText(req.Note),
 		}
 		if err := tx.Omit("Branch", "Cashier", "Customer", "Items", "Payments").Create(&sale).Error; err != nil {
 			return err
@@ -483,7 +520,7 @@ func (a *API) CreateSale(c *gin.Context) {
 		return
 	}
 	for _, hit := range lowStock {
-		a.Notify.Send(services.AlertLowStock, fmt.Sprintf("⚠️ <b>Low stock</b>\n%s: %d left (reorder point %d)", services.HTMLEscape(hit.name), hit.qty, hit.reorderPoint))
+		a.Notify.Send(companyOf(c), services.AlertLowStock, fmt.Sprintf("⚠️ <b>Low stock</b>\n%s: %d left (reorder point %d)", services.HTMLEscape(hit.name), hit.qty, hit.reorderPoint))
 	}
 	out, err := a.loadSales("s.id = ?", saleID)
 	if err != nil || len(out) == 0 {
@@ -495,7 +532,7 @@ func (a *API) CreateSale(c *gin.Context) {
 	for i, it := range sale.Items {
 		itemLines[i] = fmt.Sprintf("%d× %s", it.Qty, services.HTMLEscape(it.Name))
 	}
-	a.Notify.Send(services.AlertSaleCompleted, fmt.Sprintf(
+	a.Notify.Send(companyOf(c), services.AlertSaleCompleted, fmt.Sprintf(
 		"🧾 <b>Sale completed</b>\n%s · %s\n%s\nTotal: %s",
 		sale.ReceiptNo, services.HTMLEscape(sale.Cashier), services.FormatItemLines(itemLines, 12), services.FormatUSD(sale.TotalCents),
 	))
@@ -531,12 +568,16 @@ type editSaleReq struct {
 	Items         []editSaleItem   `json:"items" binding:"required,min=1,dive"`
 	DiscountCents int64            `json:"discount_cents" binding:"min=0"`
 	Payment       *editSalePayment `json:"payment"`
+	// The sale's note (rich text); left out, it stays as it was.
+	Note *string `json:"note" binding:"omitempty,max=20000"`
 }
 
 // EditSale corrects a still-open-shift paid sale: its lines (products, qty,
 // per-line discount, note), the cart discount, and optionally the payment
-// (method, USD/riel tender, reference). Prices come from the catalog and the
-// discount rules are CreateSale's (pos.discount + the role's percent limit).
+// (method, USD/riel tender, reference). Products already on the sale keep the
+// price and cost they were sold at; products added by the edit take the
+// catalog price. The discount rules are CreateSale's (pos.discount + the
+// role's percent limit).
 // Old lines' stock goes back and new lines' stock is taken in the same
 // transaction, so the shelf count is never briefly wrong. Loyalty points are
 // re-granted on the new total. Only a paid sale on an open shift can be edited.
@@ -558,7 +599,7 @@ func (a *API) EditSale(c *gin.Context) {
 	}
 
 	var lowStock []lowStockHit
-	allowOOS := a.loadSettings().AllowOutOfStockSale // store-wide, see CreateSale
+	allowOOS := a.loadSettings(companyOf(c)).AllowOutOfStockSale // store-wide, see CreateSale
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
 		var sale models.Sale
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&sale, id).Error; err != nil {
@@ -570,12 +611,8 @@ func (a *API) EditSale(c *gin.Context) {
 		if sale.Status != models.SalePaid {
 			return utils.NewAppError(http.StatusConflict, "SALE_NOT_EDITABLE", "Only a paid sale can be edited.")
 		}
-		var shift models.Shift
-		if err := tx.First(&shift, sale.ShiftID).Error; err != nil {
+		if _, err := lockShiftOpen(tx, sale.ShiftID, "This sale belongs to a closed shift and can't be edited."); err != nil {
 			return err
-		}
-		if shift.Status != models.ShiftOpen {
-			return utils.NewAppError(http.StatusConflict, "SHIFT_CLOSED", "This sale belongs to a closed shift and can't be edited.")
 		}
 
 		// Reverse every old line's stock (SERVICE products never had any —
@@ -583,6 +620,17 @@ func (a *API) EditSale(c *gin.Context) {
 		var oldItems []models.SaleItem
 		if err := tx.Where("sale_id = ?", id).Find(&oldItems).Error; err != nil {
 			return err
+		}
+		// A product already on the sale keeps the price, cost and name it was
+		// sold at — a catalog price or cost change since then must not
+		// re-price an old sale (or its profit) just because a note, a qty or
+		// a discount was corrected. Only products added by the edit take
+		// today's catalog price.
+		sold := map[uint64]models.SaleItem{}
+		for _, it := range oldItems {
+			if _, seen := sold[it.ProductID]; !seen {
+				sold[it.ProductID] = it
+			}
 		}
 		oldServiceIDs, err := a.serviceProductIDs(tx, oldItems)
 		if err != nil {
@@ -624,21 +672,28 @@ func (a *API) EditSale(c *gin.Context) {
 				ID          uint64
 				NameEn      string
 				Active      bool
+				Deleted     bool
 				ProductType string
 				PriceCents  int64
 				CostCents   int64
 			}
 			err := tx.Table("products p").
-				Select("p.id, p.name_en, p.active, p.product_type, COALESCE(pp.price_cents,0) AS price_cents, COALESCE(pp.cost_cents,0) AS cost_cents").
+				Select("p.id, p.name_en, p.active, p.deleted_at IS NOT NULL AS deleted, p.product_type, COALESCE(pp.price_cents,0) AS price_cents, COALESCE(pp.cost_cents,0) AS cost_cents").
 				Joins(`LEFT JOIN product_prices pp ON pp.id = (
 					SELECT x.id FROM product_prices x WHERE x.product_id = p.id AND (x.branch_id IS NULL OR x.branch_id = ?)
 					ORDER BY (x.branch_id IS NULL), x.effective_at DESC, x.id DESC LIMIT 1)`, sale.BranchID).
-				Where("p.id = ? AND p.deleted_at IS NULL", pid).Scan(&prod).Error
+				Where("p.id = ? AND p.company_id = ?", pid, companyOf(c)).Scan(&prod).Error
 			if err != nil {
 				return err
 			}
-			if prod.ID == 0 || !prod.Active {
+			orig, wasSold := sold[pid]
+			// A product already on the sale can stay even if it has since been
+			// deactivated or removed from the catalog; a new one must be on sale.
+			if prod.ID == 0 || (!wasSold && (!prod.Active || prod.Deleted)) {
 				return utils.NewAppError(http.StatusUnprocessableEntity, "PRODUCT_UNAVAILABLE", fmt.Sprintf("Product #%d isn't available for sale.", pid))
+			}
+			if wasSold {
+				prod.NameEn, prod.PriceCents, prod.CostCents = orig.NameSnapshot, orig.UnitPriceCents, orig.UnitCostCents
 			}
 			if prod.ProductType == string(models.ProductService) {
 				newServiceIDs[pid] = true
@@ -688,6 +743,9 @@ func (a *API) EditSale(c *gin.Context) {
 		}
 		totalDiscount := lineDiscounts + cartDiscount
 		total := afterLines - cartDiscount
+		// Tax at the sale's own rate, as it was sold (see tax_rates.go).
+		saleTax := sale.TaxSnapshot
+		total += withTax(&saleTax, total)
 		if totalDiscount > 0 {
 			if !hasPerm(c, "pos.discount") {
 				return utils.ErrForbidden
@@ -702,8 +760,14 @@ func (a *API) EditSale(c *gin.Context) {
 		totalRiel := utils.USDCentsToRiel(total, sale.ExchangeRate)
 		if err := tx.Model(&models.Sale{}).Where("id = ?", id).Updates(map[string]interface{}{
 			"subtotal_cents": subtotal, "discount_cents": totalDiscount, "total_cents": total, "total_riel": totalRiel, "cost_total_cents": cost,
+			"tax_cents": saleTax.TaxCents,
 		}).Error; err != nil {
 			return err
+		}
+		if req.Note != nil {
+			if err := tx.Model(&models.Sale{}).Where("id = ?", id).Update("note", utils.SanitizeRichText(*req.Note)).Error; err != nil {
+				return err
+			}
 		}
 
 		// Payment: the current row is the default; a payment in the request
@@ -742,7 +806,7 @@ func (a *API) EditSale(c *gin.Context) {
 		if sale.CustomerID != nil {
 			var earned int64
 			tx.Model(&models.LoyaltyTransaction{}).Where("sale_id = ? AND points_change > 0", id).Select("COALESCE(SUM(points_change),0)").Scan(&earned)
-			loyaltyRate := a.loadSettings().LoyaltyPointsPerUSD
+			loyaltyRate := a.loadSettings(companyOf(c)).LoyaltyPointsPerUSD
 			newPoints := int64(0)
 			if loyaltyRate > 0 {
 				newPoints = int64(math.Floor(float64(total) / 100 * loyaltyRate))
@@ -769,7 +833,7 @@ func (a *API) EditSale(c *gin.Context) {
 		return
 	}
 	for _, hit := range lowStock {
-		a.Notify.Send(services.AlertLowStock, fmt.Sprintf("⚠️ <b>Low stock</b>\n%s: %d left (reorder point %d)", services.HTMLEscape(hit.name), hit.qty, hit.reorderPoint))
+		a.Notify.Send(companyOf(c), services.AlertLowStock, fmt.Sprintf("⚠️ <b>Low stock</b>\n%s: %d left (reorder point %d)", services.HTMLEscape(hit.name), hit.qty, hit.reorderPoint))
 	}
 	out, err := a.loadSales("s.id = ?", id)
 	if err != nil || len(out) == 0 {
@@ -829,12 +893,8 @@ func (a *API) VoidSale(c *gin.Context) {
 		if sale.Status != models.SalePaid {
 			return utils.NewAppError(http.StatusConflict, "SALE_NOT_VOIDABLE", "Only a paid sale can be voided.")
 		}
-		var shift models.Shift
-		if err := tx.First(&shift, sale.ShiftID).Error; err != nil {
+		if _, err := lockShiftOpen(tx, sale.ShiftID, "This sale belongs to a closed shift and can't be voided."); err != nil {
 			return err
-		}
-		if shift.Status != models.ShiftOpen {
-			return utils.NewAppError(http.StatusConflict, "SHIFT_CLOSED", "This sale belongs to a closed shift and can't be voided.")
 		}
 		var items []models.SaleItem
 		if err := tx.Where("sale_id = ?", id).Find(&items).Error; err != nil {
@@ -890,7 +950,7 @@ func (a *API) VoidSale(c *gin.Context) {
 		for i, it := range sale.Items {
 			itemLines[i] = fmt.Sprintf("%d× %s", it.Qty, services.HTMLEscape(it.Name))
 		}
-		a.Notify.Send(services.AlertVoidRefund, fmt.Sprintf(
+		a.Notify.Send(companyOf(c), services.AlertVoidRefund, fmt.Sprintf(
 			"🚫 <b>Sale voided</b>\n%s · %s\n%s\nTotal: %s\nReason: %s",
 			sale.ReceiptNo, services.HTMLEscape(sale.Cashier), services.FormatItemLines(itemLines, 12), services.FormatUSD(sale.TotalCents), services.HTMLEscape(req.Reason),
 		))

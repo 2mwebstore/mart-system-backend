@@ -18,6 +18,7 @@ import (
 	"com-mart/backend/internal/config"
 	"com-mart/backend/internal/middleware"
 	"com-mart/backend/internal/models"
+	"com-mart/backend/internal/repositories"
 	"com-mart/backend/internal/services"
 	"com-mart/backend/internal/utils"
 )
@@ -42,6 +43,11 @@ func NewAPI(db *gorm.DB, cfg *config.Config) *API {
 
 func bind(c *gin.Context, req interface{}) bool {
 	if err := c.ShouldBindJSON(req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			utils.RespondError(c, utils.ErrPayloadTooLarge)
+			return false
+		}
 		utils.RespondError(c, utils.NewValidationError(validationFields(err)))
 		return false
 	}
@@ -102,13 +108,15 @@ func fail(c *gin.Context, err error) {
 	utils.RespondError(c, err)
 }
 
-// dbFail maps a GORM error onto the API error envelope.
+// dbFail maps a GORM error onto the API error envelope. Anything but "not
+// found" is logged and answered with a generic message: SQL errors name tables
+// and columns.
 func dbFail(c *gin.Context, err error) {
-	if err == gorm.ErrRecordNotFound {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		utils.RespondError(c, utils.ErrNotFound)
 		return
 	}
-	utils.RespondError(c, utils.NewAppError(http.StatusInternalServerError, "INTERNAL_ERROR", err.Error()))
+	utils.RespondError(c, err)
 }
 
 // Document types nextDocNumber knows about — matches the seeded rows in
@@ -124,28 +132,37 @@ const (
 // same number) and formats it as "PREFIX-000001". Must be called inside the
 // same transaction that creates the row using the number, so a rolled-back
 // create doesn't burn a number.
-func nextDocNumber(tx *gorm.DB, docType string) (string, error) {
+//
+// Each company numbers its own documents.
+func nextDocNumber(tx *gorm.DB, companyID uint64, docType string) (string, error) {
 	var seq models.NumberSequence
-	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("doc_type = ?", docType).First(&seq).Error; err != nil {
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("company_id = ? AND doc_type = ?", companyID, docType).First(&seq).Error; err != nil {
 		return "", err
 	}
-	if err := tx.Model(&models.NumberSequence{}).Where("doc_type = ?", docType).Update("next_number", seq.NextNumber+1).Error; err != nil {
+	if err := tx.Model(&models.NumberSequence{}).Where("company_id = ? AND doc_type = ?", companyID, docType).Update("next_number", seq.NextNumber+1).Error; err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("%s-%06d", seq.Prefix, seq.NextNumber), nil
 }
 
-// CurrentPermissions is a user's role permissions as they are now in the
-// database (an inactive or deleted user has none) — used by the permission
-// middleware when a token predates a grant.
-func (a *API) CurrentPermissions(userID uint64) []string {
-	var keys []string
-	a.DB.Table("users u").
-		Joins("JOIN role_permissions rp ON rp.role_id = u.role_id").
-		Joins("JOIN permissions p ON p.id = rp.permission_id").
-		Where("u.id = ? AND u.active = 1 AND u.deleted_at IS NULL", userID).
-		Pluck("p.`key`", &keys)
-	return keys
+// LoadPrincipal reads what a user may do right now while working at branchID,
+// for middleware.RequireAuth. It returns nil for a user who is disabled or
+// deleted. See repositories.UserRepository.Access for how the role is chosen.
+func (a *API) LoadPrincipal(userID, branchID uint64) (*middleware.Principal, error) {
+	access, err := repositories.NewUserRepository(a.DB).Access(userID, branchID)
+	if err != nil || access == nil {
+		return nil, err
+	}
+	return &middleware.Principal{
+		UserID:       userID,
+		CompanyID:    access.CompanyID,
+		RoleID:       access.RoleID,
+		RoleName:     access.RoleName,
+		Permissions:  access.Permissions,
+		BranchIDs:    access.BranchIDs,
+		BranchID:     access.BranchID,
+		TokenVersion: access.TokenVersion,
+	}, nil
 }
 
 // branchParam resolves the branch a request is about: ?branch_id=, falling
@@ -161,6 +178,20 @@ func branchParam(c *gin.Context) uint64 {
 		return ids[0]
 	}
 	return 0
+}
+
+// companyOf is the caller's company. RequireCompany has made sure there is
+// one; every query on a company's own table filters by it and every row
+// created in one gets it.
+func companyOf(c *gin.Context) uint64 {
+	return middleware.CompanyIDFrom(c)
+}
+
+// branchCompany is the company a branch belongs to, 0 for none.
+func (a *API) branchCompany(branchID uint64) uint64 {
+	var id uint64
+	a.DB.Raw("SELECT company_id FROM branches WHERE id = ?", branchID).Scan(&id)
+	return id
 }
 
 func canAccessBranch(c *gin.Context, branchID uint64) bool {
@@ -208,9 +239,17 @@ func rangeBounds(c *gin.Context) (start, end *time.Time) {
 	return start, end
 }
 
-// audit appends an activity_logs row. Failures are swallowed on purpose: a
-// missing audit row must never fail the business operation it describes.
+// audit appends an activity_logs row to the request's company's log.
+// Failures are swallowed on purpose: a missing audit row must never fail the
+// business operation it describes.
 func (a *API) audit(c *gin.Context, module, action, entityType string, entityID uint64, before, after interface{}) {
+	a.auditIn(c, companyOf(c), module, action, entityType, entityID, before, after)
+}
+
+// auditIn appends the row to a given company's log: what the super admin
+// does to a company is in that company's log, for its Owner to see. 0 is the
+// log of no company.
+func (a *API) auditIn(c *gin.Context, companyID uint64, module, action, entityType string, entityID uint64, before, after interface{}) {
 	enc := func(v interface{}) string {
 		// The columns are JSON typed, so "no value" must be the JSON literal
 		// null — an empty string is rejected by MySQL.
@@ -224,7 +263,12 @@ func (a *API) audit(c *gin.Context, module, action, entityType string, entityID 
 		return string(b)
 	}
 	id := entityID
+	var company *uint64
+	if companyID != 0 {
+		company = &companyID
+	}
 	_ = a.DB.Create(&models.ActivityLog{
+		CompanyID:  company,
 		UserID:     middleware.UserIDFrom(c),
 		Role:       middleware.RoleNameFrom(c),
 		Module:     module,

@@ -2,10 +2,13 @@ package handlers
 
 // Company branding: the system's name (shown in the sidebar, sign-in pages and
 // the browser tab instead of "Com Mart Control System") and the company logo.
-// Both are settings; the logo is an uploaded image (a data URL) or a web link.
-// Read publicly — the sign-in pages, the customer display and the QR table
-// menu show them before anyone signs in. The logo is served as an image of
-// its own (cacheable) so it isn't repeated inside every JSON response.
+// Both are each company's own settings; the logo is an uploaded image (a data
+// URL) or a web link. Read publicly — the till sign-in page, the customer
+// display and the QR table menu show them before anyone signs in — by the
+// company's code (?company=). Without a code, or with one that isn't an
+// active company's, it's the install's own: the default name and no logo. The
+// logo is served as an image of its own (cacheable) so it isn't repeated
+// inside every JSON response.
 
 import (
 	"crypto/sha256"
@@ -16,9 +19,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
-	"com-mart/backend/internal/models"
 	"com-mart/backend/internal/utils"
 )
 
@@ -40,18 +41,32 @@ type brandingDTO struct {
 	LogoVersion string `json:"logo_version"` // changes whenever an uploaded logo changes (cache key)
 }
 
-func (a *API) brandingSettings() (name, logo string) {
-	var rows []models.Setting
-	a.DB.Where("`key` IN ?", []string{settingCompanyName, settingCompanyLogo}).Find(&rows)
-	for _, r := range rows {
-		switch r.Key {
-		case settingCompanyName:
-			name = r.Value
-		case settingCompanyLogo:
-			logo = r.Value
-		}
+// brandingSettings is a company's name and logo as set on Settings. The name
+// falls back to the company's own; there's no logo unless one was set.
+// Company 0 (none) has neither.
+func (a *API) brandingSettings(companyID uint64) (name, logo string) {
+	if companyID == 0 {
+		return "", ""
 	}
-	return name, logo
+	m := a.companySettings(companyID, settingCompanyName, settingCompanyLogo)
+	name = m[settingCompanyName]
+	if name == "" {
+		name = a.companyName(companyID)
+	}
+	return name, m[settingCompanyLogo]
+}
+
+// publicBrandingCompany is the company a public branding request is about,
+// 0 for the install's own branding.
+func (a *API) publicBrandingCompany(c *gin.Context) uint64 {
+	if c.Query("company") == "" {
+		return 0
+	}
+	company, err := a.activeCompanyByCode(c.Query("company"))
+	if err != nil {
+		return 0
+	}
+	return company.ID
 }
 
 func toBrandingDTO(name, logo string) brandingDTO {
@@ -68,14 +83,14 @@ func toBrandingDTO(name, logo string) brandingDTO {
 
 // GetBranding is public: company name and how to show the logo.
 func (a *API) GetBranding(c *gin.Context) {
-	name, logo := a.brandingSettings()
+	name, logo := a.brandingSettings(a.publicBrandingCompany(c))
 	utils.OK(c, http.StatusOK, toBrandingDTO(name, logo))
 }
 
 // GetBrandingLogo serves an uploaded logo as an image. With ?v=<version> the
 // response can be cached for good (a new logo gets a new version).
 func (a *API) GetBrandingLogo(c *gin.Context) {
-	_, logo := a.brandingSettings()
+	_, logo := a.brandingSettings(a.publicBrandingCompany(c))
 	if !strings.HasPrefix(logo, "data:image/") {
 		if logo != "" {
 			c.Redirect(http.StatusFound, logo)
@@ -145,7 +160,7 @@ func (a *API) UpdateBranding(c *gin.Context) {
 		return
 	}
 	name := strings.TrimSpace(req.CompanyName)
-	beforeName, beforeLogo := a.brandingSettings()
+	beforeName, beforeLogo := a.brandingSettings(companyOf(c))
 	logo := beforeLogo
 	if req.Logo != nil {
 		logo = strings.TrimSpace(*req.Logo)
@@ -162,20 +177,13 @@ func (a *API) UpdateBranding(c *gin.Context) {
 	// store's name. While that's still the shipped "Com Mart" (or blank, or
 	// the old company name) it follows the company name; a header someone
 	// wrote on purpose is left alone.
-	var header models.Setting
-	a.DB.Where("`key` = ?", settingReceiptHeader).Limit(1).Find(&header)
-	headerFollows := name != beforeName && (header.Value == "" || header.Value == defaultStoreName || header.Value == beforeName)
+	header := a.companySettings(companyOf(c), settingReceiptHeader)[settingReceiptHeader]
+	headerFollows := name != beforeName && (header == "" || header == defaultStoreName || header == beforeName)
 	if headerFollows {
 		pairs[settingReceiptHeader] = name // "" falls back to the default again (loadSettings)
 	}
 	err := a.DB.Transaction(func(tx *gorm.DB) error {
-		for k, v := range pairs {
-			row := models.Setting{Key: k, Value: v}
-			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "key"}}, DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"})}).Create(&row).Error; err != nil {
-				return err
-			}
-		}
-		return nil
+		return saveCompanySettings(tx, companyOf(c), pairs)
 	})
 	if err != nil {
 		dbFail(c, err)
@@ -185,7 +193,7 @@ func (a *API) UpdateBranding(c *gin.Context) {
 	before := gin.H{"company_name": beforeName, "has_logo": beforeLogo != ""}
 	after := gin.H{"company_name": name, "has_logo": logo != ""}
 	if headerFollows {
-		before["receipt_header"], after["receipt_header"] = header.Value, name
+		before["receipt_header"], after["receipt_header"] = header, name
 	}
 	a.audit(c, "settings", "settings.branding", "settings", 0, before, after)
 	utils.OK(c, http.StatusOK, toBrandingDTO(name, logo))

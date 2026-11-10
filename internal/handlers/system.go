@@ -17,8 +17,7 @@ import (
 
 // ---- Telegram alert settings (Settings > Alerts & Backup) -------------------
 //
-// Gated by the `system.manage` permission (Owner only by default, same
-// standing as branch.manage) — the bot token is a secret and GET /settings
+// Gated by the `system.manage` permission (Owner only by default) — the bot token is a secret and GET /settings
 // is otherwise open to every signed-in user (POS cashiers included).
 
 type notifySettingsDTO struct {
@@ -37,14 +36,14 @@ func toNotifyDTO(s services.NotifySettings) notifySettingsDTO {
 }
 
 func (a *API) GetNotifySettings(c *gin.Context) {
-	utils.OK(c, http.StatusOK, toNotifyDTO(a.Notify.LoadSettings()))
+	utils.OK(c, http.StatusOK, toNotifyDTO(a.Notify.LoadSettings(companyOf(c))))
 }
 
-func validAlertTypes(in []string) ([]services.AlertType, bool) {
+func validAlertTypes(in []string, allowed []services.AlertType) ([]services.AlertType, bool) {
 	out := make([]services.AlertType, 0, len(in))
 	for _, v := range in {
 		t := services.AlertType(v)
-		if !slices.Contains(services.AllAlertTypes, t) {
+		if !slices.Contains(allowed, t) {
 			return nil, false
 		}
 		out = append(out, t)
@@ -53,11 +52,27 @@ func validAlertTypes(in []string) ([]services.AlertType, bool) {
 }
 
 func (a *API) UpdateNotifySettings(c *gin.Context) {
+	a.saveNotifySettings(c, companyOf(c), services.CompanyAlertTypes)
+}
+
+// GetPlatformNotifySettings is the super admin's own Telegram alerts (the
+// backup alerts), kept apart from every company's.
+func (a *API) GetPlatformNotifySettings(c *gin.Context) {
+	utils.OK(c, http.StatusOK, toNotifyDTO(a.Notify.LoadSettings(0)))
+}
+
+func (a *API) UpdatePlatformNotifySettings(c *gin.Context) {
+	a.saveNotifySettings(c, 0, services.PlatformAlertTypes)
+}
+
+// saveNotifySettings saves a company's alerts, or with company 0 the
+// platform's, allowing only the alert types that one can get.
+func (a *API) saveNotifySettings(c *gin.Context, companyID uint64, allowed []services.AlertType) {
 	var req notifySettingsDTO
 	if !bind(c, &req) {
 		return
 	}
-	types, ok := validAlertTypes(req.AlertTypes)
+	types, ok := validAlertTypes(req.AlertTypes, allowed)
 	if !ok {
 		invalid(c, "alert_types", "Contains an unknown alert type.")
 		return
@@ -66,9 +81,9 @@ func (a *API) UpdateNotifySettings(c *gin.Context) {
 		invalid(c, "bot_token", "Enter a bot token and chat ID before enabling alerts.")
 		return
 	}
-	before := a.Notify.LoadSettings()
+	before := a.Notify.LoadSettings(companyID)
 	next := services.NotifySettings{Enabled: req.Enabled, BotToken: req.BotToken, ChatID: req.ChatID, AlertTypes: types}
-	if err := a.Notify.SaveSettings(next); err != nil {
+	if err := a.Notify.SaveSettings(companyID, next); err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -200,8 +215,10 @@ func (a *API) RunBackupNow(c *gin.Context) {
 		if row != nil {
 			id = row.ID
 		}
+		logger := middleware.LoggerFrom(c)
+		logger.Error().Err(err).Msg("manual backup failed")
 		a.audit(c, "settings", "backup.run", "backup", id, nil, gin.H{"status": "failed", "error": err.Error()})
-		fail(c, utils.NewAppError(http.StatusUnprocessableEntity, "BACKUP_FAILED", "Backup failed: "+err.Error()))
+		fail(c, utils.NewAppError(http.StatusUnprocessableEntity, "BACKUP_FAILED", "The backup couldn't be completed. Check the server logs."))
 		return
 	}
 	a.audit(c, "settings", "backup.run", "backup", row.ID, nil, gin.H{"status": "success", "filename": row.Filename})
@@ -265,44 +282,13 @@ func (a *API) DeleteBackup(c *gin.Context) {
 	utils.OK(c, http.StatusOK, gin.H{"deleted": true})
 }
 
-// ---- Activity log retention (Settings > Alerts & Backup) -------------------
-// Same standing as backup settings: system.manage, purged nightly on the
-// same scheduler tick (see BackupService.RunScheduler) plus a manual
-// "Clear now" button here for the same reason backups got one — no need to
-// wait for tonight to see the effect of a setting you just changed.
+// ---- Activity log retention (Settings > System) ---------------------------
+// The company sees how long it keeps its activity log. The super admin sets
+// it, and clears old entries on demand (see platform.go); the nightly purge
+// runs on the backup scheduler's tick (BackupService.RunScheduler).
 
 func (a *API) GetActivityLogRetention(c *gin.Context) {
-	utils.OK(c, http.StatusOK, gin.H{"retention_months": a.Backup.LoadActivityLogRetentionMonths()})
-}
-
-type activityLogRetentionReq struct {
-	RetentionMonths int `json:"retention_months" binding:"required,oneof=1 2 3"`
-}
-
-func (a *API) UpdateActivityLogRetention(c *gin.Context) {
-	var req activityLogRetentionReq
-	if !bind(c, &req) {
-		return
-	}
-	before := a.Backup.LoadActivityLogRetentionMonths()
-	if err := a.Backup.SaveActivityLogRetentionMonths(req.RetentionMonths); err != nil {
-		dbFail(c, err)
-		return
-	}
-	a.audit(c, "settings", "settings.update", "settings", 0, gin.H{"retention_months": before}, gin.H{"retention_months": req.RetentionMonths})
-	utils.OK(c, http.StatusOK, gin.H{"retention_months": req.RetentionMonths})
-}
-
-// ClearActivityLogNow purges everything already older than the configured
-// retention window right now, instead of waiting for the nightly tick.
-func (a *API) ClearActivityLogNow(c *gin.Context) {
-	n, err := a.Backup.PurgeOldActivityLogs()
-	if err != nil {
-		dbFail(c, err)
-		return
-	}
-	a.audit(c, "settings", "activity_log.clear", "settings", 0, nil, gin.H{"deleted": n})
-	utils.OK(c, http.StatusOK, gin.H{"deleted": n})
+	utils.OK(c, http.StatusOK, gin.H{"retention_months": a.Backup.LoadActivityLogRetentionMonths(companyOf(c))})
 }
 
 // ---- Document numbering (Settings > Numbering) -----------------------------
@@ -324,7 +310,7 @@ func toSequenceDTO(s models.NumberSequence) numberSequenceDTO {
 
 func (a *API) GetNumberSequences(c *gin.Context) {
 	var rows []models.NumberSequence
-	if err := a.DB.Order("doc_type").Find(&rows).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).Order("doc_type").Find(&rows).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -350,18 +336,18 @@ func (a *API) UpdateNumberSequence(c *gin.Context) {
 		return
 	}
 	var before models.NumberSequence
-	if err := a.DB.Where("doc_type = ?", req.DocType).First(&before).Error; err != nil {
+	if err := a.DB.Where("company_id = ? AND doc_type = ?", companyOf(c), req.DocType).First(&before).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
-	if err := a.DB.Model(&models.NumberSequence{}).Where("doc_type = ?", req.DocType).Updates(map[string]interface{}{
+	if err := a.DB.Model(&models.NumberSequence{}).Where("company_id = ? AND doc_type = ?", companyOf(c), req.DocType).Updates(map[string]interface{}{
 		"prefix": req.Prefix, "next_number": req.NextNumber,
 	}).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
 	var after models.NumberSequence
-	a.DB.Where("doc_type = ?", req.DocType).First(&after)
+	a.DB.Where("company_id = ? AND doc_type = ?", companyOf(c), req.DocType).First(&after)
 	a.audit(c, "settings", "settings.update", "number_sequence", 0, toSequenceDTO(before), toSequenceDTO(after))
 	utils.OK(c, http.StatusOK, toSequenceDTO(after))
 }

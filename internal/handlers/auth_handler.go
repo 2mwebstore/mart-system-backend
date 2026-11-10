@@ -21,8 +21,7 @@ func NewAuthHandler(authService *services.AuthService) *AuthHandler {
 
 func (h *AuthHandler) Login(c *gin.Context) {
 	var req dto.LoginRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.RespondError(c, utils.NewValidationError(map[string]string{"_": err.Error()}))
+	if !bind(c, &req) {
 		return
 	}
 
@@ -36,12 +35,11 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 func (h *AuthHandler) PINLogin(c *gin.Context) {
 	var req dto.PINLoginRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.RespondError(c, utils.NewValidationError(map[string]string{"_": err.Error()}))
+	if !bind(c, &req) {
 		return
 	}
 
-	resp, err := h.authService.PINLogin(req.DeviceKey, req.Username, req.PIN, c.ClientIP())
+	resp, err := h.authService.PINLogin(req.CompanyCode, req.DeviceKey, req.Username, req.PIN, c.ClientIP())
 	if err != nil {
 		utils.RespondError(c, err)
 		return
@@ -51,8 +49,7 @@ func (h *AuthHandler) PINLogin(c *gin.Context) {
 
 func (h *AuthHandler) Refresh(c *gin.Context) {
 	var req dto.RefreshRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.RespondError(c, utils.NewValidationError(map[string]string{"_": err.Error()}))
+	if !bind(c, &req) {
 		return
 	}
 
@@ -66,8 +63,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 
 func (h *AuthHandler) Logout(c *gin.Context) {
 	var req dto.LogoutRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.RespondError(c, utils.NewValidationError(map[string]string{"_": err.Error()}))
+	if !bind(c, &req) {
 		return
 	}
 
@@ -79,10 +75,12 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 }
 
 func (h *AuthHandler) Me(c *gin.Context) {
-	resp, err := h.authService.Me(middleware.UserIDFrom(c))
+	resp, err := h.authService.Me(middleware.UserIDFrom(c), middleware.BranchIDFrom(c), middleware.ScopeFrom(c) == utils.ScopePOS)
 	if err != nil {
 		utils.RespondError(c, err)
 		return
 	}
+	// A till session gets told what it can use, not everything the role can do.
+	resp.Permissions = middleware.PermissionsFrom(c)
 	utils.OK(c, http.StatusOK, resp)
 }

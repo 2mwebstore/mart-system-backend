@@ -35,11 +35,16 @@ const (
 	AlertTableOrder    AlertType = "table_order"
 )
 
-// AllAlertTypes is every alert a role can pick from, in display order.
-var AllAlertTypes = []AlertType{
+// CompanyAlertTypes are the alerts a company can turn on, in display order:
+// what happens in its own branches.
+var CompanyAlertTypes = []AlertType{
 	AlertLowStock, AlertShiftOpened, AlertShiftClosed, AlertSaleCompleted, AlertVoidRefund, AlertExpenseAdded,
-	AlertPOReceived, AlertBackupSuccess, AlertBackupFailed, AlertTableOrder,
+	AlertPOReceived, AlertTableOrder,
 }
+
+// PlatformAlertTypes are the super admin's alerts, about the whole install.
+// They're sent with company 0 (see Send).
+var PlatformAlertTypes = []AlertType{AlertBackupSuccess, AlertBackupFailed}
 
 const (
 	settingTelegramEnabled = "telegram_enabled"
@@ -48,9 +53,11 @@ const (
 	settingTelegramAlerts  = "telegram_alert_types" // comma-separated AlertType list
 )
 
-// NotifySettings is the Telegram integration's config, as read from and
-// written to the `settings` key-value table (same table/pattern as receipt
-// header, loyalty rate, etc. — see handlers/reference.go).
+// NotifySettings is the Telegram integration's config. Each company has its
+// own, in company_settings (same table/pattern as receipt header, loyalty
+// rate, etc. — see handlers/reference.go). The install has one more, in
+// `settings`, for the alerts that aren't any company's: backups. Company id 0
+// means that one.
 type NotifySettings struct {
 	Enabled    bool        `json:"enabled"`
 	BotToken   string      `json:"bot_token"`
@@ -90,12 +97,23 @@ func FormatUSD(cents int64) string {
 	return neg + "$" + strconv.FormatInt(cents/100, 10) + "." + fmt.Sprintf("%02d", cents%100)
 }
 
-func (n *NotifyService) LoadSettings() NotifySettings {
-	var rows []models.Setting
-	n.DB.Where("`key` IN ?", []string{settingTelegramEnabled, settingTelegramToken, settingTelegramChatID, settingTelegramAlerts}).Find(&rows)
+var telegramKeys = []string{settingTelegramEnabled, settingTelegramToken, settingTelegramChatID, settingTelegramAlerts}
+
+// LoadSettings is a company's Telegram settings, or the install's for 0.
+func (n *NotifyService) LoadSettings(companyID uint64) NotifySettings {
 	m := map[string]string{}
-	for _, r := range rows {
-		m[r.Key] = r.Value
+	if companyID == 0 {
+		var rows []models.Setting
+		n.DB.Where("`key` IN ?", telegramKeys).Find(&rows)
+		for _, r := range rows {
+			m[r.Key] = r.Value
+		}
+	} else {
+		var rows []models.CompanySetting
+		n.DB.Where("company_id = ? AND `key` IN ?", companyID, telegramKeys).Find(&rows)
+		for _, r := range rows {
+			m[r.Key] = r.Value
+		}
 	}
 	var types []AlertType
 	if m[settingTelegramAlerts] != "" {
@@ -113,7 +131,8 @@ func (n *NotifyService) LoadSettings() NotifySettings {
 	}
 }
 
-func (n *NotifyService) SaveSettings(s NotifySettings) error {
+// SaveSettings writes a company's Telegram settings, or the install's for 0.
+func (n *NotifyService) SaveSettings(companyID uint64, s NotifySettings) error {
 	keys := make([]string, 0, len(s.AlertTypes))
 	for _, a := range s.AlertTypes {
 		keys = append(keys, string(a))
@@ -130,8 +149,11 @@ func (n *NotifyService) SaveSettings(s NotifySettings) error {
 	}
 	return n.DB.Transaction(func(tx *gorm.DB) error {
 		for k, v := range pairs {
-			row := models.Setting{Key: k, Value: v}
-			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "key"}}, DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"})}).Create(&row).Error; err != nil {
+			var row interface{} = &models.Setting{Key: k, Value: v}
+			if companyID != 0 {
+				row = &models.CompanySetting{CompanyID: companyID, Key: k, Value: v}
+			}
+			if err := tx.Clauses(clause.OnConflict{DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"})}).Create(row).Error; err != nil {
 				return err
 			}
 		}
@@ -143,8 +165,9 @@ func (n *NotifyService) SaveSettings(s NotifySettings) error {
 // is enabled and that type is selected. It never blocks the caller and never
 // returns an error to it — a failed alert must not fail the business action
 // that triggered it (a sale, a void, ...); the failure is logged instead.
-func (n *NotifyService) Send(t AlertType, message string) {
-	s := n.LoadSettings()
+// It goes to the company's own chat; company 0 is the install's (backups).
+func (n *NotifyService) Send(companyID uint64, t AlertType, message string) {
+	s := n.LoadSettings(companyID)
 	if !s.wants(t) {
 		return
 	}

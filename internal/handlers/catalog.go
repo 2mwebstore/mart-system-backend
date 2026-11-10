@@ -34,7 +34,7 @@ type categoryReq struct {
 
 func (a *API) ListCategories(c *gin.Context) {
 	pg := pagerOf(c)
-	base := a.DB.Table("categories c").Where("c.deleted_at IS NULL")
+	base := a.DB.Table("categories c").Where("c.company_id = ? AND c.deleted_at IS NULL", companyOf(c))
 	base = base.Session(&gorm.Session{})
 	if search := strings.TrimSpace(c.Query("q")); search != "" {
 		base = base.Where("c.name_en LIKE ? OR c.name_km LIKE ?", likeArg(search), likeArg(search))
@@ -59,7 +59,7 @@ func (a *API) CreateCategory(c *gin.Context) {
 	if !bind(c, &req) {
 		return
 	}
-	cat := models.Category{NameEn: req.NameEn, NameKm: req.NameKm}
+	cat := models.Category{CompanyID: companyOf(c), NameEn: req.NameEn, NameKm: req.NameKm}
 	if err := a.DB.Create(&cat).Error; err != nil {
 		dbFail(c, err)
 		return
@@ -78,7 +78,7 @@ func (a *API) UpdateCategory(c *gin.Context) {
 		return
 	}
 	var cat models.Category
-	if err := a.DB.First(&cat, id).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).First(&cat, id).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -98,7 +98,7 @@ func (a *API) DeleteCategory(c *gin.Context) {
 		return
 	}
 	var cat models.Category
-	if err := a.DB.First(&cat, id).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).First(&cat, id).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -142,7 +142,7 @@ func toSupplierDTO(s models.Supplier) supplierDTO {
 
 func (a *API) ListSuppliers(c *gin.Context) {
 	pg := pagerOf(c)
-	base := a.DB.Table("suppliers s").Where("s.deleted_at IS NULL")
+	base := a.DB.Table("suppliers s").Where("s.company_id = ? AND s.deleted_at IS NULL", companyOf(c))
 	base = base.Session(&gorm.Session{})
 	if search := strings.TrimSpace(c.Query("q")); search != "" {
 		base = base.Where("s.name LIKE ? OR s.phone LIKE ? OR s.contact LIKE ?", likeArg(search), likeArg(search), likeArg(search))
@@ -167,7 +167,7 @@ func (a *API) CreateSupplier(c *gin.Context) {
 	if !bind(c, &req) {
 		return
 	}
-	s := models.Supplier{Name: req.Name, Phone: req.Phone, Contact: req.Contact, PaymentTerms: req.PaymentTerms}
+	s := models.Supplier{CompanyID: companyOf(c), Name: req.Name, Phone: req.Phone, Contact: req.Contact, PaymentTerms: req.PaymentTerms}
 	if err := a.DB.Create(&s).Error; err != nil {
 		dbFail(c, err)
 		return
@@ -186,7 +186,7 @@ func (a *API) UpdateSupplier(c *gin.Context) {
 		return
 	}
 	var s models.Supplier
-	if err := a.DB.First(&s, id).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).First(&s, id).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -206,7 +206,7 @@ func (a *API) DeleteSupplier(c *gin.Context) {
 		return
 	}
 	var s models.Supplier
-	if err := a.DB.First(&s, id).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).First(&s, id).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -266,7 +266,21 @@ type productDTO struct {
 // caller that cares about "out of stock" / "below reorder" additionally
 // gates on product_type = 'STANDARD', a plain 0 would be misleading on its
 // own for something that was never meant to be stocked.
+//
+// Only the branch's company's products are in it.
 func (a *API) productQuery(branchID uint64) *gorm.DB {
+	return a.companyProducts(a.DB.Table("branches").Select("company_id").Where("id = ?", branchID), branchID)
+}
+
+// companyProductQuery is productQuery for a company's catalog, whether or
+// not the company has a branch yet.
+func (a *API) companyProductQuery(companyID, branchID uint64) *gorm.DB {
+	return a.companyProducts(companyID, branchID)
+}
+
+// companyProducts is productQuery for the company given as an id or as a
+// subquery selecting one.
+func (a *API) companyProducts(company interface{}, branchID uint64) *gorm.DB {
 	return a.DB.Table("products p").
 		Select(`p.id, p.parent_product_id, pp2.name_en AS parent_name_en, pp2.name_km AS parent_name_km, p.variant_name,
 			(SELECT COUNT(*) FROM products v WHERE v.parent_product_id = p.id AND v.deleted_at IS NULL) AS variant_count,
@@ -283,7 +297,7 @@ func (a *API) productQuery(branchID uint64) *gorm.DB {
 			SELECT x.id FROM product_prices x
 			WHERE x.product_id = p.id AND (x.branch_id IS NULL OR x.branch_id = ?)
 			ORDER BY (x.branch_id IS NULL), x.effective_at DESC, x.id DESC LIMIT 1)`, branchID).
-		Where("p.deleted_at IS NULL")
+		Where("p.company_id = (?) AND p.deleted_at IS NULL", company)
 }
 
 // productSummary is the whole-branch inventory KPI block (not affected by the
@@ -302,7 +316,7 @@ type productSummary struct {
 func (a *API) ListProducts(c *gin.Context) {
 	branchID := branchParam(c)
 	pg := pagerOf(c)
-	all := func() *gorm.DB { return a.DB.Table("(?) AS t", a.productQuery(branchID)) }
+	all := func() *gorm.DB { return a.DB.Table("(?) AS t", a.companyProductQuery(companyOf(c), branchID)) }
 	base := all()
 	if search := strings.TrimSpace(c.Query("q")); search != "" {
 		base = base.Where("t.name_en LIKE ? OR t.name_km LIKE ? OR t.sku LIKE ? OR t.barcode LIKE ?", likeArg(search), likeArg(search), likeArg(search), likeArg(search))
@@ -349,9 +363,10 @@ func (a *API) ListProducts(c *gin.Context) {
 	pg.respond(c, rows, total, summary)
 }
 
-func (a *API) getProduct(branchID, id uint64) (*productDTO, error) {
+// getProduct is one of the company's products, with its stock at branchID.
+func (a *API) getProduct(companyID, branchID, id uint64) (*productDTO, error) {
 	var rows []productDTO
-	if err := a.productQuery(branchID).Where("p.id = ?", id).Scan(&rows).Error; err != nil {
+	if err := a.companyProductQuery(companyID, branchID).Where("p.id = ?", id).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
@@ -411,6 +426,32 @@ func skuPrefix(name string) string {
 	return b.String()
 }
 
+// nextSKU is a new product's SKU: the prefix and the company's next number
+// under it (DRI-001, DRI-002, …). Each company counts on its own, so its
+// numbers start at 001 and say nothing about other companies' products. The
+// count never goes below the highest SKU the company already has under the
+// prefix (a seeded catalogue, or SKUs from before counting), so none is handed
+// out twice. The counter's row stays locked until tx ends, so products made at
+// the same moment get different numbers.
+func nextSKU(tx *gorm.DB, companyID uint64, prefix string) (string, error) {
+	var highest uint64
+	if err := tx.Raw(`SELECT COALESCE(MAX(CAST(SUBSTRING(sku, ?) AS UNSIGNED)), 0) FROM products
+		WHERE company_id = ? AND sku LIKE ? AND sku REGEXP ?`,
+		len(prefix)+2, companyID, prefix+"-%", "^"+prefix+"-[0-9]+$").Scan(&highest).Error; err != nil {
+		return "", err
+	}
+	if err := tx.Exec(`INSERT INTO sku_counters (company_id, prefix, last_number) VALUES (?, ?, ?)
+		ON DUPLICATE KEY UPDATE last_number = GREATEST(last_number + 1, ?)`,
+		companyID, prefix, highest+1, highest+1).Error; err != nil {
+		return "", err
+	}
+	var n uint64
+	if err := tx.Raw("SELECT last_number FROM sku_counters WHERE company_id = ? AND prefix = ?", companyID, prefix).Scan(&n).Error; err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s-%03d", prefix, n), nil
+}
+
 func nullableString(s string) *string {
 	if strings.TrimSpace(s) == "" {
 		return nil
@@ -432,7 +473,7 @@ func (a *API) loadVariantParent(c *gin.Context, req productReq) (*models.Product
 		return nil, false
 	}
 	var parent models.Product
-	if err := a.DB.First(&parent, *req.ParentProductID).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).First(&parent, *req.ParentProductID).Error; err != nil {
 		invalid(c, "parent_product_id", "Parent product not found.")
 		return nil, false
 	}
@@ -467,6 +508,8 @@ func (a *API) CreateProduct(c *gin.Context) {
 	} else if nameEn == "" {
 		invalid(c, "name_en", "Name (English) is required.")
 		return
+	} else if !a.ownCategoryAndSupplier(c, categoryID, supplierID) {
+		return
 	}
 	unit := req.Unit
 	if unit == "" {
@@ -481,17 +524,18 @@ func (a *API) CreateProduct(c *gin.Context) {
 				prefix = skuPrefix(cat.NameEn)
 			}
 		}
+		sku, err := nextSKU(tx, companyOf(c), prefix)
+		if err != nil {
+			return err
+		}
 		created = models.Product{
+			CompanyID:       companyOf(c),
 			ParentProductID: req.ParentProductID, VariantName: req.VariantName,
-			SKU: fmt.Sprintf("TMP-%d", time.Now().UnixNano()), Barcode: nullableString(req.Barcode), NameEn: nameEn, NameKm: nameKm,
+			SKU: sku, Barcode: nullableString(req.Barcode), NameEn: nameEn, NameKm: nameKm,
 			CategoryID: categoryID, SupplierID: supplierID, Unit: unit, Type: productType, ImageURL: imageURL, Active: req.Active,
 			HideWhenOutOfStock: req.HideWhenOutOfStock,
 		}
 		if err := tx.Create(&created).Error; err != nil {
-			return err
-		}
-		created.SKU = fmt.Sprintf("%s-%03d", prefix, created.ID)
-		if err := tx.Model(&created).Update("sku", created.SKU).Error; err != nil {
 			return err
 		}
 		if err := tx.Create(&models.ProductPrice{ProductID: created.ID, PriceCents: req.PriceCents, CostCents: req.CostCents, EffectiveAt: time.Now(), CreatedAt: time.Now()}).Error; err != nil {
@@ -501,7 +545,7 @@ func (a *API) CreateProduct(c *gin.Context) {
 		// not even a zeroed one — see the ProductType doc comment.
 		if created.Type == models.ProductStandard {
 			var branches []models.Branch
-			if err := tx.Find(&branches).Error; err != nil {
+			if err := tx.Where("company_id = ?", companyOf(c)).Find(&branches).Error; err != nil {
 				return err
 			}
 			for _, b := range branches {
@@ -517,7 +561,7 @@ func (a *API) CreateProduct(c *gin.Context) {
 		return
 	}
 	a.audit(c, "inventory", "product.create", "product", created.ID, nil, req)
-	dto, err := a.getProduct(branchParam(c), created.ID)
+	dto, err := a.getProduct(companyOf(c), branchParam(c), created.ID)
 	if err != nil {
 		dbFail(c, err)
 		return
@@ -535,7 +579,7 @@ func (a *API) UpdateProduct(c *gin.Context) {
 		return
 	}
 	branchID := branchParam(c)
-	before, err := a.getProduct(branchID, id)
+	before, err := a.getProduct(companyOf(c), branchID, id)
 	if err != nil {
 		dbFail(c, err)
 		return
@@ -558,6 +602,8 @@ func (a *API) UpdateProduct(c *gin.Context) {
 		categoryID, supplierID, imageURL = before.CategoryID, before.SupplierID, before.ImageURL
 		productType = models.ProductType(before.ProductType)
 		variantName = req.VariantName
+	} else if !a.ownCategoryAndSupplier(c, categoryID, supplierID) {
+		return
 	}
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&models.Product{}).Where("id = ?", id).Updates(map[string]interface{}{
@@ -590,7 +636,7 @@ func (a *API) UpdateProduct(c *gin.Context) {
 		// it back to STANDARD later re-enters this branch and creates them.
 		if productType == models.ProductStandard {
 			var branches []models.Branch
-			if err := tx.Find(&branches).Error; err != nil {
+			if err := tx.Where("company_id = ?", companyOf(c)).Find(&branches).Error; err != nil {
 				return err
 			}
 			for _, b := range branches {
@@ -606,7 +652,7 @@ func (a *API) UpdateProduct(c *gin.Context) {
 		dbFail(c, err)
 		return
 	}
-	after, _ := a.getProduct(branchID, id)
+	after, _ := a.getProduct(companyOf(c), branchID, id)
 	a.audit(c, "inventory", "product.update", "product", id, before, after)
 	utils.OK(c, http.StatusOK, after)
 }
@@ -616,7 +662,7 @@ func (a *API) DeleteProduct(c *gin.Context) {
 	if !ok {
 		return
 	}
-	before, err := a.getProduct(branchParam(c), id)
+	before, err := a.getProduct(companyOf(c), branchParam(c), id)
 	if err != nil {
 		dbFail(c, err)
 		return
@@ -639,6 +685,28 @@ func (a *API) DeleteProduct(c *gin.Context) {
 	}
 	a.audit(c, "inventory", "product.delete", "product", id, before, nil)
 	utils.OK(c, http.StatusOK, gin.H{"deleted": true})
+}
+
+// ownCategoryAndSupplier refuses a category or supplier that isn't the
+// company's own, answering 422 on that field. Missing ones are fine.
+func (a *API) ownCategoryAndSupplier(c *gin.Context, categoryID, supplierID *uint64) bool {
+	if categoryID != nil && !a.companyOwns(c, &models.Category{}, *categoryID) {
+		invalid(c, "category_id", "Category not found.")
+		return false
+	}
+	if supplierID != nil && !a.companyOwns(c, &models.Supplier{}, *supplierID) {
+		invalid(c, "supplier_id", "Supplier not found.")
+		return false
+	}
+	return true
+}
+
+// companyOwns reports whether the row of model's table with this id is the
+// caller's company's and not deleted.
+func (a *API) companyOwns(c *gin.Context, model interface{}, id uint64) bool {
+	var n int64
+	a.DB.Model(model).Where("id = ? AND company_id = ?", id, companyOf(c)).Count(&n)
+	return n > 0
 }
 
 // ---- Stock movements -----------------------------------------------------------
@@ -875,11 +943,11 @@ func (a *API) ImportCategories(c *gin.Context) {
 			continue
 		}
 		var existing models.Category
-		if err := a.DB.Where("LOWER(name_en) = ?", strings.ToLower(nameEn)).First(&existing).Error; err == nil {
+		if err := a.DB.Where("company_id = ? AND LOWER(name_en) = ?", companyOf(c), strings.ToLower(nameEn)).First(&existing).Error; err == nil {
 			result.Skipped = append(result.Skipped, importRowError{rowNum, fmt.Sprintf("%q already exists.", nameEn)})
 			continue
 		}
-		if err := a.DB.Create(&models.Category{NameEn: nameEn, NameKm: nameKm}).Error; err != nil {
+		if err := a.DB.Create(&models.Category{CompanyID: companyOf(c), NameEn: nameEn, NameKm: nameKm}).Error; err != nil {
 			result.Skipped = append(result.Skipped, importRowError{rowNum, "Could not save this row."})
 			continue
 		}
@@ -928,7 +996,7 @@ func (a *API) ImportProducts(c *gin.Context) {
 	idx := csvHeaderIndex(rows[0])
 
 	var categories []models.Category
-	a.DB.Find(&categories)
+	a.DB.Where("company_id = ?", companyOf(c)).Find(&categories)
 	catByName := make(map[string]uint64, len(categories))
 	catByID := make(map[uint64]bool, len(categories))
 	for _, cat := range categories {
@@ -936,14 +1004,14 @@ func (a *API) ImportProducts(c *gin.Context) {
 		catByID[cat.ID] = true
 	}
 	var branches []models.Branch
-	if err := a.DB.Find(&branches).Error; err != nil {
+	if err := a.DB.Where("company_id = ?", companyOf(c)).Find(&branches).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
 	// Seeded from the DB, then grown as rows are created, so a row can name
 	// a parent that only exists earlier in this same file.
 	var existing []models.Product
-	a.DB.Find(&existing)
+	a.DB.Where("company_id = ?", companyOf(c)).Find(&existing)
 	bySKU := make(map[string]models.Product, len(existing))
 	for _, p := range existing {
 		bySKU[strings.ToUpper(p.SKU)] = p
@@ -1060,16 +1128,17 @@ func (a *API) ImportProducts(c *gin.Context) {
 					prefix = skuPrefix(cat.NameEn)
 				}
 			}
+			sku, err := nextSKU(tx, companyOf(c), prefix)
+			if err != nil {
+				return err
+			}
 			created = models.Product{
+				CompanyID:       companyOf(c),
 				ParentProductID: parentID, VariantName: variantName,
-				SKU: fmt.Sprintf("TMP-%d-%d", time.Now().UnixNano(), rowNum), Barcode: nullableString(barcode), NameEn: nameEn, NameKm: nameKm,
+				SKU: sku, Barcode: nullableString(barcode), NameEn: nameEn, NameKm: nameKm,
 				CategoryID: categoryID, Unit: unit, Type: productType, ImageURL: imageURL, Active: active,
 			}
 			if err := tx.Create(&created).Error; err != nil {
-				return err
-			}
-			created.SKU = fmt.Sprintf("%s-%03d", prefix, created.ID)
-			if err := tx.Model(&created).Update("sku", created.SKU).Error; err != nil {
 				return err
 			}
 			if err := tx.Create(&models.ProductPrice{ProductID: created.ID, PriceCents: price, CostCents: cost, EffectiveAt: time.Now(), CreatedAt: time.Now()}).Error; err != nil {

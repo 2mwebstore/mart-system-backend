@@ -23,6 +23,9 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to load config")
 	}
+	if err := cfg.Validate(); err != nil {
+		log.Fatal().Err(err).Msg("refusing to start with an insecure config")
+	}
 
 	loc, err := time.LoadLocation(cfg.AppTimezone)
 	if err != nil {

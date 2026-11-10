@@ -3,3 +3,5 @@ tmp
 *.exe
 coverage.out
 .env
+backups
+.git

@@ -5,10 +5,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+
+	"com-mart/backend/internal/utils"
 )
 
 const RequestIDKey = "request_id"
-const LoggerKey = "logger"
+const LoggerKey = utils.LoggerContextKey
 
 // RequestID assigns a UUID per request (reusing an inbound X-Request-Id if
 // present), echoes it back in the response header, and stashes a

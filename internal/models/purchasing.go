@@ -18,7 +18,10 @@ type PurchaseOrder struct {
 	Status        PurchaseOrderStatus `gorm:"size:20;not null;default:'DRAFT';index" json:"status"`
 	Note          string              `gorm:"type:text" json:"note"` // rich text (sanitised HTML)
 	ShippingCents int64               `gorm:"not null;default:0" json:"shipping_cents"`
-	UserID        uint64              `gorm:"not null" json:"user_id"`
+	// Tax on the items after discounts plus shipping. It is never part of
+	// the stock's cost (see docs/DECISIONS.md).
+	TaxSnapshot `gorm:"embedded"`
+	UserID      uint64 `gorm:"not null" json:"user_id"`
 	Timestamps
 
 	Supplier *Supplier           `gorm:"foreignKey:SupplierID" json:"supplier,omitempty"`

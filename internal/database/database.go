@@ -3,6 +3,8 @@ package database
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
 	"time"
 
 	"gorm.io/driver/mysql"
@@ -15,13 +17,8 @@ import (
 // Connect opens the GORM/MySQL connection pool. Schema is managed entirely
 // by migrations/*.sql (golang-migrate) — GORM AutoMigrate is never called.
 func Connect(cfg *config.Config) (*gorm.DB, error) {
-	logLevel := logger.Warn
-	if !cfg.IsProduction() {
-		logLevel = logger.Info
-	}
-
 	db, err := gorm.Open(mysql.Open(cfg.DSN()), &gorm.Config{
-		Logger:                                   logger.Default.LogMode(logLevel),
+		Logger:                                   newLogger(log.New(os.Stdout, "\r\n", log.LstdFlags), cfg.IsProduction()),
 		DisableForeignKeyConstraintWhenMigrating: true,
 	})
 	if err != nil {
@@ -43,6 +40,25 @@ func Connect(cfg *config.Config) (*gorm.DB, error) {
 	}
 
 	return db, nil
+}
+
+// newLogger logs every query in development. In production it logs only errors
+// and slow queries, and without their values: those include usernames, password
+// hashes and token hashes. A row not being found doesn't count as an error, since
+// a mistyped username or an old refresh token is normal, and otherwise anyone could
+// write what they like into the logs (people do type passwords as usernames).
+func newLogger(out logger.Writer, production bool) logger.Interface {
+	level := logger.Info
+	if production {
+		level = logger.Warn
+	}
+	return logger.New(out, logger.Config{
+		SlowThreshold:             200 * time.Millisecond,
+		LogLevel:                  level,
+		IgnoreRecordNotFoundError: true,
+		ParameterizedQueries:      production,
+		Colorful:                  !production,
+	})
 }
 
 // WithTransaction runs fn inside a DB transaction, committing on success

@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -69,7 +68,7 @@ type tableBoardDTO struct {
 }
 
 // ListTableBoard is the POS's list of a branch's tables for the Tables board:
-// names only, no QR tokens (those stay with branch.manage). The board joins
+// names only, no QR tokens (those need table.view). The board joins
 // this with the open orders the POS already polls.
 func (a *API) ListTableBoard(c *gin.Context) {
 	branchID := branchParam(c)
@@ -261,14 +260,15 @@ type menuItemDTO struct {
 	Available       bool    `json:"available"`
 }
 
-// activeTableByToken finds an active table (in an active branch) by its QR token.
+// activeTableByToken finds an active table (in an active branch of an active
+// company) by its QR token.
 func (a *API) activeTableByToken(token string) (*models.DiningTable, *models.Branch, error) {
 	var t models.DiningTable
 	if err := a.DB.Where("token = ? AND active = 1", token).First(&t).Error; err != nil {
 		return nil, nil, err
 	}
 	var b models.Branch
-	if err := a.DB.Where("id = ? AND active = 1", t.BranchID).First(&b).Error; err != nil {
+	if err := a.DB.Where("id = ? AND active = 1 AND company_id IN (SELECT id FROM companies WHERE active = 1 AND deleted_at IS NULL)", t.BranchID).First(&b).Error; err != nil {
 		return nil, nil, err
 	}
 	return &t, &b, nil
@@ -278,16 +278,16 @@ func tableNotFound(c *gin.Context) {
 	fail(c, utils.NewAppError(http.StatusNotFound, "TABLE_NOT_FOUND", "This table's QR code isn't active. Please ask a staff member."))
 }
 
-// menuItems is the branch's orderable catalog for customers: active products
-// with their branch price and whether they can be ordered now. Cost and stock
-// counts are deliberately not exposed.
-func (a *API) menuItems(branchID uint64) ([]menuItemDTO, error) {
+// menuItems is the branch's orderable catalog for customers: its company's
+// active products with their branch price and whether they can be ordered
+// now. Cost and stock counts are deliberately not exposed.
+func (a *API) menuItems(branch *models.Branch) ([]menuItemDTO, error) {
 	var rows []productDTO
-	if err := a.productQuery(branchID).Where("p.active = 1").
+	if err := a.companyProductQuery(branch.CompanyID, branch.ID).Where("p.active = 1").
 		Order("COALESCE(p.parent_product_id, p.id), (p.parent_product_id IS NOT NULL), p.id").Scan(&rows).Error; err != nil {
 		return nil, err
 	}
-	allowOOS := a.loadSettings().AllowOutOfStockSale
+	allowOOS := a.loadSettings(branch.CompanyID).AllowOutOfStockSale
 	out := make([]menuItemDTO, 0, len(rows))
 	for _, p := range rows {
 		available := p.ProductType == string(models.ProductService) || allowOOS || p.Qty > 0
@@ -310,7 +310,7 @@ func (a *API) PublicTableMenu(c *gin.Context) {
 		tableNotFound(c)
 		return
 	}
-	items, err := a.menuItems(branch.ID)
+	items, err := a.menuItems(branch)
 	if err != nil {
 		dbFail(c, err)
 		return
@@ -318,8 +318,8 @@ func (a *API) PublicTableMenu(c *gin.Context) {
 	utils.OK(c, http.StatusOK, gin.H{
 		"table":         gin.H{"name": table.Name},
 		"branch":        gin.H{"name": branch.Name},
-		"store_name":    a.loadSettings().ReceiptHeader,
-		"exchange_rate": a.currentRate(), // riel per USD, for showing totals in both
+		"store_name":    a.loadSettings(branch.CompanyID).ReceiptHeader,
+		"exchange_rate": a.currentRate(branch.CompanyID), // riel per USD, for showing totals in both
 		"items":         items,
 	})
 }
@@ -365,45 +365,15 @@ func (a *API) publicOrder(o models.TableOrder) (publicOrderDTO, error) {
 	}, err
 }
 
-// orderLimiter caps how fast one phone can send orders to one table — the QR
-// is public, so this stops a stuck button or a prank from flooding the POS.
-type orderLimiter struct {
-	mu   sync.Mutex
-	hits map[string][]time.Time
-}
-
-var publicOrderLimiter = &orderLimiter{hits: map[string][]time.Time{}}
+// publicOrderLimiter caps how fast one phone can send orders to one table — the
+// QR is public, so this stops a stuck button or a prank from flooding the POS.
+var publicOrderLimiter = utils.NewSlidingWindow(publicOrderWindow, publicOrderMax)
 
 const (
 	publicOrderWindow = 5 * time.Minute
 	publicOrderMax    = 5 // per table + client IP per window
 	tableOpenOrderMax = 15
 )
-
-func (l *orderLimiter) allow(key string, now time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	kept := l.hits[key][:0]
-	for _, t := range l.hits[key] {
-		if now.Sub(t) < publicOrderWindow {
-			kept = append(kept, t)
-		}
-	}
-	if len(kept) >= publicOrderMax {
-		l.hits[key] = kept
-		return false
-	}
-	l.hits[key] = append(kept, now)
-	// Drop idle keys now and then so the map can't grow without bound.
-	if len(l.hits) > 5000 {
-		for k, v := range l.hits {
-			if len(v) == 0 || now.Sub(v[len(v)-1]) >= publicOrderWindow {
-				delete(l.hits, k)
-			}
-		}
-	}
-	return true
-}
 
 // PlacePublicTableOrder: the customer sends products, quantities and notes;
 // names and prices come from the catalog, never from the request.
@@ -424,7 +394,7 @@ func (a *API) PlacePublicTableOrder(c *gin.Context) {
 		fail(c, utils.NewAppError(http.StatusTooManyRequests, "TABLE_BUSY", "This table already has orders waiting. Please wait for staff."))
 		return
 	}
-	if !publicOrderLimiter.allow(token+"|"+c.ClientIP(), time.Now()) {
+	if !publicOrderLimiter.Allow(token+"|"+c.ClientIP(), time.Now()) {
 		fail(c, utils.NewAppError(http.StatusTooManyRequests, "TOO_MANY_ORDERS", "Too many orders from this phone. Please wait a few minutes or ask staff."))
 		return
 	}
@@ -450,7 +420,7 @@ func (a *API) PlacePublicTableOrder(c *gin.Context) {
 		}
 	}
 
-	menu, err := a.menuItems(branch.ID)
+	menu, err := a.menuItems(branch)
 	if err != nil {
 		dbFail(c, err)
 		return
@@ -512,7 +482,7 @@ func (a *API) PlacePublicTableOrder(c *gin.Context) {
 	for i, it := range items {
 		lines[i] = fmt.Sprintf("%d× %s", it.Qty, services.HTMLEscape(it.NameEn))
 	}
-	a.Notify.Send(services.AlertTableOrder, fmt.Sprintf("🍽 <b>New table order</b>\n%s · %s\n%s\nTotal: %s",
+	a.Notify.Send(branch.CompanyID, services.AlertTableOrder, fmt.Sprintf("🍽 <b>New table order</b>\n%s · %s\n%s\nTotal: %s",
 		services.HTMLEscape(table.Name), services.HTMLEscape(branch.Name), services.FormatItemLines(lines, 12), services.FormatUSD(total)))
 
 	out, err := a.publicOrder(o)

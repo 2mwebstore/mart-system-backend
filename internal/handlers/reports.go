@@ -10,11 +10,17 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"com-mart/backend/internal/middleware"
+	"com-mart/backend/internal/models"
 	"com-mart/backend/internal/utils"
 )
 
 // Every report counts PAID sales only: a voided sale is reversed out of
 // stock, loyalty and the drawer, so it must not appear in revenue either.
+//
+// Sales figures leave out the tax added on top (total_cents - tax_cents): it
+// is collected for the tax office, not earned. Lists of receipts, payment
+// totals and shift cash keep it, since it is money that was taken.
 
 type dailyPoint struct {
 	Date          string `json:"date"`
@@ -28,7 +34,7 @@ type dailyPoint struct {
 func (a *API) dailySeries(branchID uint64, from, to time.Time) ([]dailyPoint, error) {
 	var rows []dailyPoint
 	err := a.DB.Table("sales").
-		Select("DATE_FORMAT(sold_at,'%Y-%m-%d') AS date, SUM(total_cents) AS net_sales_cents, COUNT(*) AS transactions, SUM(cost_total_cents) AS cost_cents").
+		Select("DATE_FORMAT(sold_at,'%Y-%m-%d') AS date, SUM(total_cents - tax_cents) AS net_sales_cents, COUNT(*) AS transactions, SUM(cost_total_cents) AS cost_cents").
 		Where("branch_id = ? AND status = 'PAID' AND sold_at >= ? AND sold_at < ?", branchID, from, to).
 		Group("DATE_FORMAT(sold_at,'%Y-%m-%d')").Scan(&rows).Error
 	if err != nil {
@@ -62,7 +68,7 @@ func (a *API) Dashboard(c *gin.Context) {
 		Net   int64
 		Count int64
 	}
-	if err := a.DB.Table("sales").Select("COALESCE(SUM(total_cents),0) AS net, COUNT(*) AS count").
+	if err := a.DB.Table("sales").Select("COALESCE(SUM(total_cents - tax_cents),0) AS net, COUNT(*) AS count").
 		Where("branch_id = ? AND status = 'PAID' AND sold_at >= ? AND sold_at < ?", branchID, day, next).Scan(&todayAgg).Error; err != nil {
 		dbFail(c, err)
 		return
@@ -134,7 +140,7 @@ func (a *API) Dashboard(c *gin.Context) {
 	}
 	utils.OK(c, http.StatusOK, gin.H{
 		"date":                   day.Format("2006-01-02"),
-		"exchange_rate":          a.currentRate(),
+		"exchange_rate":          a.currentRate(companyOf(c)),
 		"net_sales_cents":        todayAgg.Net,
 		"transactions":           todayAgg.Count,
 		"last_week_transactions": lastWeekCount,
@@ -203,13 +209,14 @@ func (a *API) StaffReport(c *gin.Context) {
 			CASE WHEN u.active = 0 THEN 'Off'
 			     WHEN EXISTS (SELECT 1 FROM shifts sh WHERE sh.user_id = u.id AND sh.branch_id = ? AND sh.status = 'OPEN') THEN 'Open'
 			     ELSE 'Closed' END AS shift_status,
-			COALESCE((SELECT SUM(s.total_cents) FROM sales s WHERE s.cashier_id = u.id AND s.branch_id = ? AND s.status = 'PAID' AND s.sold_at >= ? AND s.sold_at < ?),0) AS sales_today_cents
-		FROM users u JOIN roles r ON r.id = u.role_id
+			COALESCE((SELECT SUM(s.total_cents - s.tax_cents) FROM sales s WHERE s.cashier_id = u.id AND s.branch_id = ? AND s.status = 'PAID' AND s.sold_at >= ? AND s.sold_at < ?),0) AS sales_today_cents
+		FROM users u
+		JOIN user_branches ub ON ub.user_id = u.id AND ub.branch_id = ?
+		JOIN roles r ON r.id = COALESCE(ub.role_id, u.role_id)
 		WHERE u.deleted_at IS NULL AND r.name IN ('Cashier','Manager')
-		  AND EXISTS (SELECT 1 FROM user_branches ub WHERE ub.user_id = u.id AND ub.branch_id = ?)
 		ORDER BY u.id`, branchID, branchID, today(), today().AddDate(0, 0, 1), branchID).Scan(&staff)
 
-	roles, err := a.rolesSummary()
+	roles, err := a.rolesSummary(companyOf(c), branchID)
 	if err != nil {
 		dbFail(c, err)
 		return
@@ -235,9 +242,10 @@ type roleSummary struct {
 // rolesSummary is the permission-coverage table on the Reports & Staff page:
 // per role, how many of each permission group it holds. Computed here (not
 // by the page calling /roles) so staff who can see reports but can't manage
-// roles still get it.
-func (a *API) rolesSummary() ([]roleSummary, error) {
-	roles, err := a.loadRoles(0)
+// roles still get it. It covers the roles that can be held at the branch: the
+// shared ones and the branch's own.
+func (a *API) rolesSummary(companyID, branchID uint64) ([]roleSummary, error) {
+	roles, err := a.queryRoles(roleQuery{CompanyID: companyID, Branches: []uint64{branchID}, Scoped: true})
 	if err != nil {
 		return nil, err
 	}
@@ -283,26 +291,29 @@ func (a *API) ProfitLoss(c *gin.Context) {
 		Discount int64
 		Net      int64
 		Cogs     int64
+		Tax      int64
 	}
 	if err := a.DB.Table("sales").Select(`COALESCE(SUM(subtotal_cents),0) AS gross, COALESCE(SUM(discount_cents),0) AS discount,
-			COALESCE(SUM(total_cents),0) AS net, COALESCE(SUM(cost_total_cents),0) AS cogs`).
+			COALESCE(SUM(total_cents - tax_cents),0) AS net, COALESCE(SUM(cost_total_cents),0) AS cogs, COALESCE(SUM(tax_cents),0) AS tax`).
 		Where("branch_id = ? AND status = 'PAID' AND sold_at >= ? AND sold_at < ?", branchID, from, to).Scan(&agg).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
 	// Invoices (back-office sales) count on their invoice date, paid or not —
 	// the stock left then. Shipping is part of their gross; line and invoice
-	// discounts together are their discount, so gross − discount = total.
+	// discounts together are their discount, so gross − discount = net (the
+	// total before tax).
 	var inv struct {
 		Gross    int64
 		Discount int64
 		Net      int64
 		Cogs     int64
 		Count    int64
+		Tax      int64
 	}
 	if err := a.DB.Table("invoices").Select(`COALESCE(SUM(subtotal_cents + shipping_cents),0) AS gross,
-			COALESCE(SUM(line_discount_cents + discount_cents),0) AS discount, COALESCE(SUM(total_cents),0) AS net,
-			COALESCE(SUM(cost_total_cents),0) AS cogs, COUNT(*) AS count`).
+			COALESCE(SUM(line_discount_cents + discount_cents),0) AS discount, COALESCE(SUM(total_cents - tax_cents),0) AS net,
+			COALESCE(SUM(cost_total_cents),0) AS cogs, COUNT(*) AS count, COALESCE(SUM(tax_cents),0) AS tax`).
 		Where("branch_id = ? AND status = 'OPEN' AND invoice_date >= ? AND invoice_date < ?", branchID, from, to).Scan(&inv).Error; err != nil {
 		dbFail(c, err)
 		return
@@ -324,6 +335,14 @@ func (a *API) ProfitLoss(c *gin.Context) {
 	for _, e := range exp {
 		totalExp += e.AmountCents
 	}
+	// Tax paid: on expenses (the amounts above are before it), and on
+	// purchase orders received in the period (a received order can't be
+	// edited, so it was last updated when it came in). Neither is a cost.
+	var expTax, poTax int64
+	a.DB.Table("expenses").Select("COALESCE(SUM(tax_cents),0)").
+		Where("branch_id = ? AND deleted_at IS NULL AND expense_date >= ? AND expense_date < ?", branchID, from, to).Scan(&expTax)
+	a.DB.Table("purchase_orders").Select("COALESCE(SUM(tax_cents),0)").
+		Where("branch_id = ? AND status = 'RECEIVED' AND updated_at >= ? AND updated_at < ?", branchID, from, to).Scan(&poTax)
 
 	type profRow struct {
 		Name        string  `json:"name"`
@@ -398,7 +417,7 @@ func (a *API) ProfitLoss(c *gin.Context) {
 		NetCents  int64
 		CostCents int64
 	}
-	a.DB.Table("invoices").Select("DATE_FORMAT(invoice_date,'%Y-%m-%d') AS date, SUM(total_cents) AS net_cents, SUM(cost_total_cents) AS cost_cents").
+	a.DB.Table("invoices").Select("DATE_FORMAT(invoice_date,'%Y-%m-%d') AS date, SUM(total_cents - tax_cents) AS net_cents, SUM(cost_total_cents) AS cost_cents").
 		Where("branch_id = ? AND status = 'OPEN' AND invoice_date >= ? AND invoice_date < ?", branchID, from, to).
 		Group("DATE_FORMAT(invoice_date,'%Y-%m-%d')").Scan(&dayInv)
 	invByDay := map[string]int64{}
@@ -417,12 +436,18 @@ func (a *API) ProfitLoss(c *gin.Context) {
 	agg.Cogs += inv.Cogs
 	grossProfit := agg.Net - returns - agg.Cogs
 	utils.OK(c, http.StatusOK, gin.H{
-		"exchange_rate": a.currentRate(), "gross_sales_cents": agg.Gross, "discount_cents": agg.Discount, "returns_cents": returns,
+		"exchange_rate": a.currentRate(companyOf(c)), "gross_sales_cents": agg.Gross, "discount_cents": agg.Discount, "returns_cents": returns,
 		"net_sales_cents": agg.Net - returns, "cogs_cents": agg.Cogs, "gross_profit_cents": grossProfit,
 		"expenses_by_category": exp, "total_expenses_cents": totalExp, "net_profit_cents": grossProfit - totalExp,
 		"profit_by_category": byCat, "net_profit_by_day": netByDay,
 		// Where net sales came from: the till, and invoices (by invoice date).
 		"pos_sales_cents": posNet, "invoice_sales_cents": inv.Net, "invoice_count": inv.Count,
+		// Tax added on top: collected on sales and invoices, paid on expenses
+		// and received purchase orders. None of it is in the figures above.
+		"tax": gin.H{
+			"collected_cents": agg.Tax + inv.Tax, "pos_cents": agg.Tax, "invoice_cents": inv.Tax,
+			"paid_cents": expTax + poTax, "expense_cents": expTax, "purchase_cents": poTax,
+		},
 	})
 }
 
@@ -592,7 +617,7 @@ func (a *API) ByCashierReport(c *gin.Context) {
 	var rows []row
 	err := a.DB.Raw(`SELECT u.id, u.full_name AS name,
 			(SELECT COUNT(*) FROM shifts sh WHERE sh.user_id = u.id AND sh.branch_id = ? AND sh.opened_at >= ? AND sh.opened_at < ?) AS shifts,
-			COALESCE((SELECT SUM(s.total_cents) FROM sales s WHERE s.cashier_id = u.id AND s.branch_id = ? AND s.status='PAID' AND s.sold_at >= ? AND s.sold_at < ?),0) AS sales_cents,
+			COALESCE((SELECT SUM(s.total_cents - s.tax_cents) FROM sales s WHERE s.cashier_id = u.id AND s.branch_id = ? AND s.status='PAID' AND s.sold_at >= ? AND s.sold_at < ?),0) AS sales_cents,
 			(SELECT COUNT(*) FROM sales s WHERE s.cashier_id = u.id AND s.branch_id = ? AND s.status='PAID' AND s.sold_at >= ? AND s.sold_at < ?) AS transactions,
 			(SELECT COUNT(*) FROM voids_refunds vr JOIN sales s ON s.id = vr.sale_id WHERE vr.cashier_id = u.id AND vr.type='VOID' AND s.branch_id = ? AND vr.created_at >= ? AND vr.created_at < ?) AS voids,
 			(SELECT COUNT(*) FROM voids_refunds vr JOIN sales s ON s.id = vr.sale_id WHERE vr.cashier_id = u.id AND vr.type='REFUND' AND s.branch_id = ? AND vr.created_at >= ? AND vr.created_at < ?) AS refunds,
@@ -736,8 +761,15 @@ func (a *API) ActivityLogReport(c *gin.Context) {
 		IP         string    `json:"ip"`
 	}
 	base := func() *gorm.DB {
-		return a.DB.Table("activity_logs al").Joins("LEFT JOIN users u ON u.id = al.user_id").
-			Where("al.created_at >= ? AND al.created_at < ?", from, to)
+		q := a.DB.Table("activity_logs al").Joins("LEFT JOIN users u ON u.id = al.user_id").
+			Where("al.company_id = ? AND al.created_at >= ? AND al.created_at < ?", companyOf(c), from, to)
+		// The log has no branch of its own: scope by who did it, so a manager
+		// sees the staff of their own branches and an Owner sees everyone in
+		// the company.
+		if middleware.RoleNameFrom(c) != models.RoleOwner {
+			q = q.Where("al.user_id IN (SELECT ub.user_id FROM user_branches ub WHERE ub.branch_id IN ?)", middleware.BranchIDsFrom(c))
+		}
+		return q
 	}
 	var agg struct {
 		Events  int64

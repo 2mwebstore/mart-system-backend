@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"com-mart/backend/internal/middleware"
 	"com-mart/backend/internal/models"
@@ -164,7 +165,7 @@ func hideExpectedIfBlind(c *gin.Context, s *shiftDTO) {
 
 func (a *API) deviceByKey(c *gin.Context, key string) (*models.Device, bool) {
 	var d models.Device
-	if err := a.DB.Where("device_key = ? AND active = 1", key).First(&d).Error; err != nil {
+	if err := a.DB.Where("company_id = ? AND device_key = ? AND active = 1", companyOf(c), key).First(&d).Error; err != nil {
 		fail(c, utils.NewAppError(http.StatusUnprocessableEntity, "UNKNOWN_DEVICE", "That till isn't registered or is inactive."))
 		return nil, false
 	}
@@ -230,7 +231,7 @@ func (a *API) OpenShift(c *gin.Context) {
 		}
 		s := models.Shift{
 			BranchID: d.BranchID, DeviceID: d.ID, UserID: middleware.UserIDFrom(c), Status: models.ShiftOpen, OpenedAt: time.Now(),
-			ExchangeRate: a.currentRate(), OpeningUSDCents: req.OpeningUSDCents, OpeningKHRRiel: req.OpeningKHRRiel,
+			ExchangeRate: a.currentRate(companyOf(c)), OpeningUSDCents: req.OpeningUSDCents, OpeningKHRRiel: req.OpeningKHRRiel,
 		}
 		if err := tx.Omit("Device", "User").Create(&s).Error; err != nil {
 			return err
@@ -250,7 +251,7 @@ func (a *API) OpenShift(c *gin.Context) {
 	a.audit(c, "shift", "shift.open", "shift", shiftID, nil, gin.H{"device": d.Name, "opening_usd_cents": req.OpeningUSDCents, "opening_khr_riel": req.OpeningKHRRiel})
 	dto, _ := buildShift(a.DB, shiftID)
 	hideExpectedIfBlind(c, dto)
-	a.Notify.Send(services.AlertShiftOpened, fmt.Sprintf(
+	a.Notify.Send(companyOf(c), services.AlertShiftOpened, fmt.Sprintf(
 		"🟢 <b>Shift opened</b>\n%s · %s\nOpening float: %s + ៛%d",
 		services.HTMLEscape(dto.DeviceName), services.HTMLEscape(dto.CashierName), services.FormatUSD(req.OpeningUSDCents), req.OpeningKHRRiel,
 	))
@@ -259,6 +260,22 @@ func (a *API) OpenShift(c *gin.Context) {
 
 // loadOwnedOpenShift loads an open shift the caller may act on: their own,
 // or anyone's if they hold shift.close_others.
+// lockShiftOpen takes a shared lock on a shift row and checks the shift is
+// still open. Everything that changes a shift's money — a sale, a sale edit,
+// a void, a cash movement — holds it until it commits, and CloseShift takes
+// the exclusive lock. So a close waits for those in flight and counts them,
+// and nothing can be added to or changed in a shift once it's closed.
+func lockShiftOpen(tx *gorm.DB, shiftID uint64, closedMsg string) (*models.Shift, error) {
+	var s models.Shift
+	if err := tx.Clauses(clause.Locking{Strength: "SHARE"}).First(&s, shiftID).Error; err != nil {
+		return nil, err
+	}
+	if s.Status != models.ShiftOpen {
+		return nil, utils.NewAppError(http.StatusConflict, "SHIFT_CLOSED", closedMsg)
+	}
+	return &s, nil
+}
+
 func (a *API) loadActableShift(c *gin.Context, id uint64) (*models.Shift, bool) {
 	var s models.Shift
 	if err := a.DB.First(&s, id).Error; err != nil {
@@ -302,7 +319,17 @@ func (a *API) AddCashMovement(c *gin.Context) {
 		return
 	}
 	m := models.CashMovement{ShiftID: id, Type: models.CashMovementType(req.Type), AmountUSDCents: req.AmountUSDCents, AmountKHRRiel: req.AmountKHRRiel, Reason: req.Reason, UserID: middleware.UserIDFrom(c), CreatedAt: time.Now()}
-	if err := a.DB.Create(&m).Error; err != nil {
+	err := a.DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := lockShiftOpen(tx, id, "This shift is already closed."); err != nil {
+			return err
+		}
+		return tx.Create(&m).Error
+	})
+	if err != nil {
+		if ae, ok := err.(*utils.AppError); ok {
+			fail(c, ae)
+			return
+		}
 		dbFail(c, err)
 		return
 	}
@@ -330,6 +357,17 @@ func (a *API) CloseShift(c *gin.Context) {
 	}
 	var final *shiftDTO
 	err := a.DB.Transaction(func(tx *gorm.DB) error {
+		// The exclusive lock waits for any sale / edit / void / cash movement
+		// still in flight on this shift (they hold it shared), so the
+		// expected cash below includes them; and a second close of the same
+		// shift finds it already closed.
+		var locked models.Shift
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&locked, id).Error; err != nil {
+			return err
+		}
+		if locked.Status != models.ShiftOpen {
+			return utils.NewAppError(http.StatusConflict, "SHIFT_CLOSED", "This shift is already closed.")
+		}
 		live, err := buildShift(tx, id)
 		if err != nil {
 			return err
@@ -348,6 +386,10 @@ func (a *API) CloseShift(c *gin.Context) {
 		return err
 	})
 	if err != nil {
+		if ae, ok := err.(*utils.AppError); ok {
+			fail(c, ae)
+			return
+		}
 		dbFail(c, err)
 		return
 	}
@@ -362,7 +404,7 @@ func (a *API) CloseShift(c *gin.Context) {
 	} else if final.DiffUSDCents > 0 || final.DiffKHRRiel > 0 {
 		status = "🔺 Over"
 	}
-	a.Notify.Send(services.AlertShiftClosed, fmt.Sprintf(
+	a.Notify.Send(companyOf(c), services.AlertShiftClosed, fmt.Sprintf(
 		"🔒 <b>Shift closed</b>\n%s · %s\nGross sales: %s\nDiff: %s (%s / ៛%d)",
 		services.HTMLEscape(final.DeviceName), services.HTMLEscape(final.CashierName),
 		services.FormatUSD(final.GrossSalesCents), status, services.FormatUSD(final.DiffUSDCents), final.DiffKHRRiel,

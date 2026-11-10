@@ -103,9 +103,10 @@ const (
 	defaultActivityLogRetentionMonths = 3
 )
 
-func (b *BackupService) LoadActivityLogRetentionMonths() int {
-	var row models.Setting
-	if err := b.DB.Where("`key` = ?", settingActivityLogRetentionMonths).First(&row).Error; err != nil {
+// LoadActivityLogRetentionMonths is how long a company keeps its activity log.
+func (b *BackupService) LoadActivityLogRetentionMonths(companyID uint64) int {
+	var row models.CompanySetting
+	if err := b.DB.Where("company_id = ? AND `key` = ?", companyID, settingActivityLogRetentionMonths).First(&row).Error; err != nil {
 		return defaultActivityLogRetentionMonths
 	}
 	months, err := strconv.Atoi(row.Value)
@@ -115,23 +116,44 @@ func (b *BackupService) LoadActivityLogRetentionMonths() int {
 	return months
 }
 
-func (b *BackupService) SaveActivityLogRetentionMonths(months int) error {
+// SaveActivityLogRetentionMonths sets how long a company keeps its activity
+// log, with db (a transaction, say). The super admin sets it.
+func SaveActivityLogRetentionMonths(db *gorm.DB, companyID uint64, months int) error {
 	if months <= 0 {
 		months = defaultActivityLogRetentionMonths
 	}
-	row := models.Setting{Key: settingActivityLogRetentionMonths, Value: strconv.Itoa(months)}
-	return b.DB.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "key"}}, DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"})}).Create(&row).Error
+	row := models.CompanySetting{CompanyID: companyID, Key: settingActivityLogRetentionMonths, Value: strconv.Itoa(months)}
+	return db.Clauses(clause.OnConflict{DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"})}).Create(&row).Error
 }
 
-// PurgeOldActivityLogs hard-deletes every activity_logs row older than the
-// configured retention window (ActivityLog has no SoftDelete — a retention
+// PurgeCompanyActivityLogs hard-deletes a company's activity_logs rows older
+// than its retention window (ActivityLog has no SoftDelete — a retention
 // purge that only flagged rows instead of removing them would defeat the
 // point). Returns how many rows it removed.
-func (b *BackupService) PurgeOldActivityLogs() (int64, error) {
-	months := b.LoadActivityLogRetentionMonths()
-	cutoff := time.Now().AddDate(0, -months, 0)
-	res := b.DB.Where("created_at < ?", cutoff).Delete(&models.ActivityLog{})
+func (b *BackupService) PurgeCompanyActivityLogs(companyID uint64) (int64, error) {
+	cutoff := time.Now().AddDate(0, -b.LoadActivityLogRetentionMonths(companyID), 0)
+	res := b.DB.Where("company_id = ? AND created_at < ?", companyID, cutoff).Delete(&models.ActivityLog{})
 	return res.RowsAffected, res.Error
+}
+
+// PurgeOldActivityLogs purges every company's log by its own retention, and
+// what super admins did by the default one. Returns how many rows it removed.
+func (b *BackupService) PurgeOldActivityLogs() (int64, error) {
+	var companies []uint64
+	if err := b.DB.Model(&models.Company{}).Pluck("id", &companies).Error; err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, id := range companies {
+		n, err := b.PurgeCompanyActivityLogs(id)
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	cutoff := time.Now().AddDate(0, -defaultActivityLogRetentionMonths, 0)
+	res := b.DB.Where("company_id IS NULL AND created_at < ?", cutoff).Delete(&models.ActivityLog{})
+	return total + res.RowsAffected, res.Error
 }
 
 func (b *BackupService) List(limit int) ([]models.Backup, error) {
@@ -185,9 +207,9 @@ func (b *BackupService) Run(ctx context.Context, trigger models.BackupTrigger, t
 	}
 
 	if runErr != nil {
-		b.Notify.Send(AlertBackupFailed, fmt.Sprintf("❌ <b>Backup failed</b>\n%s\n%s", filename, HTMLEscape(runErr.Error())))
+		b.Notify.Send(0, AlertBackupFailed, fmt.Sprintf("❌ <b>Backup failed</b>\n%s\n%s", filename, HTMLEscape(runErr.Error())))
 	} else {
-		b.Notify.Send(AlertBackupSuccess, fmt.Sprintf("✅ <b>Backup complete</b>\n%s (%s)", filename, humanSize(size)))
+		b.Notify.Send(0, AlertBackupSuccess, fmt.Sprintf("✅ <b>Backup complete</b>\n%s (%s)", filename, humanSize(size)))
 		b.applyRetention()
 	}
 	return row, runErr

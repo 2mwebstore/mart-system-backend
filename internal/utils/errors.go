@@ -1,10 +1,16 @@
 package utils
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
+
+// LoggerContextKey is where middleware.RequestID keeps the request's logger.
+const LoggerContextKey = "logger"
 
 // ErrorBody is the "error" part of the response envelope.
 type ErrorBody struct {
@@ -47,14 +53,18 @@ var (
 	ErrAccountDisabled  = NewAppError(http.StatusForbidden, "ACCOUNT_DISABLED", "This account has been disabled.")
 	ErrInsufficientCash = NewAppError(http.StatusUnprocessableEntity, "INSUFFICIENT_CASH", "Amount received is less than the amount due.")
 	ErrInternal         = NewAppError(http.StatusInternalServerError, "INTERNAL_ERROR", "Something went wrong. Please try again.")
+	ErrRateLimited      = NewAppError(http.StatusTooManyRequests, "RATE_LIMITED", "Too many requests. Please wait a moment and try again.")
+	ErrPayloadTooLarge  = NewAppError(http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE", "That request is too large.")
 )
 
-// RespondError writes an AppError (or wraps a plain error as internal) using
-// the standard envelope, and logs 5xx errors via the request-scoped logger.
+// RespondError writes an AppError using the standard envelope. Any other error
+// is unexpected: it's logged in full, and the client gets a generic message so
+// SQL, file paths and the like never leave the server.
 func RespondError(c *gin.Context, err error) {
-	appErr, ok := err.(*AppError)
-	if !ok {
-		appErr = &AppError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: err.Error()}
+	var appErr *AppError
+	if !errors.As(err, &appErr) {
+		requestLogger(c).Error().Err(err).Msg("request failed")
+		appErr = ErrInternal
 	}
 	c.JSON(appErr.Status, Envelope{
 		Success: false,
@@ -65,4 +75,13 @@ func RespondError(c *gin.Context, err error) {
 			Fields:  appErr.Fields,
 		},
 	})
+}
+
+func requestLogger(c *gin.Context) *zerolog.Logger {
+	if v, ok := c.Get(LoggerContextKey); ok {
+		if l, ok := v.(zerolog.Logger); ok {
+			return &l
+		}
+	}
+	return &log.Logger
 }

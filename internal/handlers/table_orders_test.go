@@ -3,23 +3,25 @@ package handlers
 import (
 	"testing"
 	"time"
+
+	"com-mart/backend/internal/utils"
 )
 
 func TestOrderLimiter(t *testing.T) {
-	l := &orderLimiter{hits: map[string][]time.Time{}}
+	l := utils.NewSlidingWindow(publicOrderWindow, publicOrderMax)
 	now := time.Now()
 	for i := 0; i < publicOrderMax; i++ {
-		if !l.allow("tbl|1.2.3.4", now) {
+		if !l.Allow("tbl|1.2.3.4", now) {
 			t.Fatalf("order %d should be allowed", i+1)
 		}
 	}
-	if l.allow("tbl|1.2.3.4", now) {
+	if l.Allow("tbl|1.2.3.4", now) {
 		t.Fatal("order over the limit should be refused")
 	}
-	if !l.allow("tbl|5.6.7.8", now) {
+	if !l.Allow("tbl|5.6.7.8", now) {
 		t.Fatal("another phone at the same table has its own allowance")
 	}
-	if !l.allow("tbl|1.2.3.4", now.Add(publicOrderWindow+time.Second)) {
+	if !l.Allow("tbl|1.2.3.4", now.Add(publicOrderWindow+time.Second)) {
 		t.Fatal("allowed again once the window has passed")
 	}
 }

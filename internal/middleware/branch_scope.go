@@ -11,9 +11,9 @@ import (
 )
 
 // BranchScope 403s if the request's `branch_id` query/param targets a
-// branch the caller doesn't have access to. Owner tokens carry every
-// branch ID (assigned at login, see services/auth_service.go), so this
-// check is uniform across roles — no special-casing "is Owner" here.
+// branch the caller doesn't have access to. RequireAuth loads the caller's
+// branches from the database on each request, and an Owner gets every active
+// one, so this check is uniform across roles — no special-casing "is Owner" here.
 // Must run after RequireAuth.
 func BranchScope() gin.HandlerFunc {
 	return func(c *gin.Context) {

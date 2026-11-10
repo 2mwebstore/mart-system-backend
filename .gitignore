@@ -1,0 +1,14 @@
+# Secrets. Keep .env.example in the repo root as the template.
+.env
+.env.*
+
+# Database dumps hold customers, staff and password hashes.
+backups/
+*.sql
+*.sql.gz
+!migrations/*.sql
+
+bin/
+*.test
+*.out
+.DS_Store

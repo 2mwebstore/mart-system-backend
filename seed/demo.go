@@ -82,64 +82,46 @@ var demoProducts = []demoProduct{
 	{sku: "HHD-002-L", barcode: "8850004005", parent: "HHD-002", variant: "Large", priceCents: 260, cost: 170, stock: map[string]int64{"TK": 25, "BKK1": 9, "SS": 5}, reorder: 10},
 }
 
-func seedDemoData(db *gorm.DB, branches map[string]models.Branch, users map[string]models.User) {
+func seedDemoData(db *gorm.DB, companyID uint64, branches map[string]models.Branch, users map[string]models.User) {
 	var existing int64
-	db.Model(&models.Product{}).Count(&existing)
+	db.Model(&models.Product{}).Where("company_id = ?", companyID).Count(&existing)
 	if existing > 0 {
 		log.Info().Msg("catalog already present — skipping demo data")
 		return
 	}
-	if err := db.Transaction(func(tx *gorm.DB) error { return seedDemoTx(tx, branches, users) }); err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error { return seedDemoTx(tx, companyID, branches, users) }); err != nil {
 		log.Fatal().Err(err).Msg("failed to seed demo data")
 	}
 	log.Info().Msg("demo data seeded")
 }
 
-func seedDemoTx(tx *gorm.DB, branches map[string]models.Branch, users map[string]models.User) error {
+func seedDemoTx(tx *gorm.DB, companyID uint64, branches map[string]models.Branch, users map[string]models.User) error {
 	owner := users["sok.dara"]
 
 	// Extra tills so the other branches can have shift history too.
 	extra := []struct{ branch, name, key string }{{"BKK1", "Till 1", "BKK1-TILL-1"}, {"SS", "Till 1", "SS-TILL-1"}}
 	for _, e := range extra {
 		var d models.Device
-		if err := tx.Where("device_key = ?", e.key).First(&d).Error; err == gorm.ErrRecordNotFound {
-			if err := tx.Create(&models.Device{BranchID: branches[e.branch].ID, Name: e.name, DeviceKey: e.key, Active: true}).Error; err != nil {
+		if err := tx.Where("company_id = ? AND device_key = ?", companyID, e.key).First(&d).Error; err == gorm.ErrRecordNotFound {
+			if err := tx.Create(&models.Device{CompanyID: companyID, BranchID: branches[e.branch].ID, Name: e.name, DeviceKey: e.key, Active: true}).Error; err != nil {
 				return err
 			}
 		}
 	}
 
-	for _, s := range []models.Setting{
-		{Key: "receipt_header", Value: "Com Mart"},
-		{Key: "receipt_footer", Value: "Thank you for shopping with us! សូមអរគុណ"},
-	} {
-		// Save() on an existing `key` issues a full-column UPDATE using this
-		// freshly-built struct's zero-value CreatedAt, which MySQL's strict
-		// mode rejects as an invalid '0000-00-00' date. OnConflict only
-		// touches the columns actually being seeded, leaving created_at (and
-		// the row entirely, if it's untouched otherwise) alone — same
-		// pattern as BackupService.SaveActivityLogRetentionMonths.
-		if err := tx.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "key"}},
-			DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"}),
-		}).Create(&s).Error; err != nil {
-			return err
-		}
-	}
-	for _, p := range []models.PaymentMethodRow{
-		{Name: "Cash", Type: "CASH", FeePercent: 0, Enabled: true},
-		{Name: "KHQR (Bakong)", Type: "KHQR", FeePercent: 0, Enabled: true},
-		{Name: "Card — Visa / Mastercard", Type: "CARD", FeePercent: 2.5, Enabled: true},
-		{Name: "Card — UPI", Type: "CARD", FeePercent: 1.8, Enabled: false},
-	} {
-		if err := tx.Create(&p).Error; err != nil {
-			return err
-		}
+	seedCompanySettings(tx, companyID, map[string]string{
+		"receipt_header": "Com Mart",
+		"receipt_footer": "Thank you for shopping with us! សូមអរគុណ",
+	}, true)
+	// Cash, KHQR and Visa / Mastercard come with every company (see
+	// services.SetUpCompany); the demo adds one that's turned off.
+	if err := tx.Create(&models.PaymentMethodRow{CompanyID: companyID, Name: "Card — UPI", Type: "CARD", FeePercent: 1.8, Enabled: false}).Error; err != nil {
+		return err
 	}
 
 	catID := map[string]uint64{}
 	for i, c := range demoCategories {
-		cat := models.Category{NameEn: c.en, NameKm: c.km, Sort: i}
+		cat := models.Category{CompanyID: companyID, NameEn: c.en, NameKm: c.km, Sort: i}
 		if err := tx.Create(&cat).Error; err != nil {
 			return err
 		}
@@ -147,7 +129,7 @@ func seedDemoTx(tx *gorm.DB, branches map[string]models.Branch, users map[string
 	}
 	supID := map[string]uint64{}
 	for _, s := range demoSuppliers {
-		sup := models.Supplier{Name: s.name, Phone: s.phone, Contact: s.contact, PaymentTerms: s.terms}
+		sup := models.Supplier{CompanyID: companyID, Name: s.name, Phone: s.phone, Contact: s.contact, PaymentTerms: s.terms}
 		if err := tx.Create(&sup).Error; err != nil {
 			return err
 		}
@@ -161,7 +143,7 @@ func seedDemoTx(tx *gorm.DB, branches map[string]models.Branch, users map[string
 	bySKU := map[string]models.Product{}
 	for _, dp := range demoProducts {
 		bc := dp.barcode
-		p := models.Product{SKU: dp.sku, Barcode: &bc, Active: true}
+		p := models.Product{CompanyID: companyID, SKU: dp.sku, Barcode: &bc, Active: true}
 		if dp.parent != "" {
 			// A variant: category/supplier/unit/type/image are inherited
 			// from the parent (already created earlier in this slice), same
@@ -198,7 +180,7 @@ func seedDemoTx(tx *gorm.DB, branches map[string]models.Branch, users map[string
 	}
 	var custIDs []uint64
 	for _, c := range customers {
-		cu := models.Customer{Name: c.name, Phone: c.phone, Tier: models.CustomerTier(c.tier), Points: c.points}
+		cu := models.Customer{CompanyID: companyID, Name: c.name, Phone: c.phone, Tier: models.CustomerTier(c.tier), Points: c.points}
 		if err := tx.Create(&cu).Error; err != nil {
 			return err
 		}
@@ -490,7 +472,7 @@ func seedDemoTx(tx *gorm.DB, branches map[string]models.Branch, users map[string
 		}{{"PAN-002", 10, 510}}},
 	}
 	for _, pd := range pos {
-		code, err := seedDocNumber(tx, "PURCHASE_ORDER")
+		code, err := seedDocNumber(tx, companyID, "PURCHASE_ORDER")
 		if err != nil {
 			return err
 		}
@@ -526,7 +508,7 @@ func seedDemoTx(tx *gorm.DB, branches map[string]models.Branch, users map[string
 		{11, models.ExpensePackaging, 3100, "Plastic bags restock"}, {13, models.ExpenseInternet, 2500, "Fiber internet"},
 	} {
 		day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local).AddDate(0, 0, -e.daysAgo)
-		code, err := seedDocNumber(tx, "EXPENSE")
+		code, err := seedDocNumber(tx, companyID, "EXPENSE")
 		if err != nil {
 			return err
 		}
@@ -537,15 +519,15 @@ func seedDemoTx(tx *gorm.DB, branches map[string]models.Branch, users map[string
 	return nil
 }
 
-// seedDocNumber takes the next number from number_sequences, the same way the
-// app numbers a new PO or expense (handlers.nextDocNumber), so demo documents
-// get a real code instead of a blank one.
-func seedDocNumber(tx *gorm.DB, docType string) (string, error) {
+// seedDocNumber takes the company's next number from number_sequences, the
+// same way the app numbers a new PO or expense (handlers.nextDocNumber), so
+// demo documents get a real code instead of a blank one.
+func seedDocNumber(tx *gorm.DB, companyID uint64, docType string) (string, error) {
 	var seq models.NumberSequence
-	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("doc_type = ?", docType).First(&seq).Error; err != nil {
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("company_id = ? AND doc_type = ?", companyID, docType).First(&seq).Error; err != nil {
 		return "", err
 	}
-	if err := tx.Model(&models.NumberSequence{}).Where("doc_type = ?", docType).Update("next_number", seq.NextNumber+1).Error; err != nil {
+	if err := tx.Model(&models.NumberSequence{}).Where("company_id = ? AND doc_type = ?", companyID, docType).Update("next_number", seq.NextNumber+1).Error; err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("%s-%06d", seq.Prefix, seq.NextNumber), nil

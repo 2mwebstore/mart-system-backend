@@ -5,7 +5,9 @@ import "time"
 // ActivityLog is an append-only audit trail row. before_json/after_json
 // are stored as raw JSON since the shape varies per entity type.
 type ActivityLog struct {
-	ID         uint64    `gorm:"primaryKey" json:"id"`
+	ID uint64 `gorm:"primaryKey" json:"id"`
+	// CompanyID is nil for what a super admin did.
+	CompanyID  *uint64   `gorm:"index" json:"-"`
 	UserID     uint64    `gorm:"not null;index" json:"user_id"`
 	Role       string    `gorm:"size:60" json:"role"`
 	BranchID   *uint64   `gorm:"index" json:"branch_id,omitempty"`

@@ -3,10 +3,11 @@ package models
 import "time"
 
 type Category struct {
-	ID     uint64 `gorm:"primaryKey" json:"id"`
-	NameEn string `gorm:"size:100;not null" json:"name_en"`
-	NameKm string `gorm:"size:100" json:"name_km"`
-	Sort   int    `gorm:"not null;default:0" json:"sort"`
+	ID        uint64 `gorm:"primaryKey" json:"id"`
+	CompanyID uint64 `gorm:"not null;index" json:"-"`
+	NameEn    string `gorm:"size:100;not null" json:"name_en"`
+	NameKm    string `gorm:"size:100" json:"name_km"`
+	Sort      int    `gorm:"not null;default:0" json:"sort"`
 	Timestamps
 	SoftDelete
 }
@@ -15,6 +16,7 @@ func (Category) TableName() string { return "categories" }
 
 type Supplier struct {
 	ID           uint64 `gorm:"primaryKey" json:"id"`
+	CompanyID    uint64 `gorm:"not null;index" json:"-"`
 	Name         string `gorm:"size:150;not null" json:"name"`
 	Phone        string `gorm:"size:30" json:"phone"`
 	Contact      string `gorm:"size:150" json:"contact"`
@@ -48,8 +50,9 @@ const (
 // variants table.
 type Product struct {
 	ID              uint64      `gorm:"primaryKey" json:"id"`
+	CompanyID       uint64      `gorm:"not null;index" json:"-"`
 	ParentProductID *uint64     `gorm:"index" json:"parent_product_id,omitempty"`
-	SKU             string      `gorm:"size:60;not null;uniqueIndex" json:"sku"`
+	SKU             string      `gorm:"size:60;not null" json:"sku"` // unique within the company
 	Barcode         *string     `gorm:"size:60;index" json:"barcode,omitempty"`
 	NameEn          string      `gorm:"size:150;not null" json:"name_en"`
 	NameKm          string      `gorm:"size:150" json:"name_km"`
