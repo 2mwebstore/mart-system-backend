@@ -17,6 +17,9 @@ type ErrorBody struct {
 	Code    string            `json:"code"`
 	Message string            `json:"message"`
 	Fields  map[string]string `json:"fields,omitempty"`
+	// Details: more about the refusal, for the client to lay out (e.g. what
+	// still uses a record that can't be deleted).
+	Details interface{} `json:"details,omitempty"`
 }
 
 // AppError is a typed application error that carries an HTTP status and a
@@ -27,6 +30,7 @@ type AppError struct {
 	Code    string
 	Message string
 	Fields  map[string]string
+	Details interface{}
 }
 
 func (e *AppError) Error() string { return e.Message }
@@ -73,6 +77,7 @@ func RespondError(c *gin.Context, err error) {
 			Code:    appErr.Code,
 			Message: appErr.Message,
 			Fields:  appErr.Fields,
+			Details: appErr.Details,
 		},
 	})
 }

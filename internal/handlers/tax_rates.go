@@ -101,9 +101,9 @@ func (a *API) UpdateTaxRate(c *gin.Context) {
 	utils.OK(c, http.StatusOK, toTaxRateDTO(r))
 }
 
-// DeleteTaxRate soft-deletes the rate: documents that used it keep their
-// snapshot (and their foreign key). A place that started on it starts with no
-// tax from then on.
+// DeleteTaxRate soft-deletes a rate no document has used (one that was used
+// is refused, see in_use.go). A place that started on it starts with no tax
+// from then on.
 func (a *API) DeleteTaxRate(c *gin.Context) {
 	id, ok := idParam(c)
 	if !ok {
@@ -113,6 +113,16 @@ func (a *API) DeleteTaxRate(c *gin.Context) {
 	var r models.TaxRate
 	if err := a.DB.Where("company_id = ?", company).First(&r, id).Error; err != nil {
 		dbFail(c, err)
+		return
+	}
+	// A rate any document used stays (each keeps its copy, but also its id);
+	// it's switched off instead.
+	if a.refuseIfUsed(c, "TAX_RATE_IN_USE", inUseDetails{Entity: "tax_rate", Name: r.Name, Hint: hintSwitchOff},
+		countWhere("sales", "sales", "tax_rate_id = ?", id),
+		countWhere("invoices", "invoices", "tax_rate_id = ?", id),
+		countWhere("purchase_orders", "purchase_orders", "tax_rate_id = ?", id),
+		countWhere("expenses", "expenses", "tax_rate_id = ?", id),
+	) {
 		return
 	}
 	err := a.DB.Transaction(func(tx *gorm.DB) error {

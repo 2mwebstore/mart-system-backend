@@ -102,14 +102,13 @@ func (a *API) DeleteCategory(c *gin.Context) {
 		dbFail(c, err)
 		return
 	}
-	err := a.DB.Transaction(func(tx *gorm.DB) error {
-		// Products in a deleted category simply become uncategorised.
-		if err := tx.Model(&models.Product{}).Where("category_id = ?", id).Update("category_id", nil).Error; err != nil {
-			return err
-		}
-		return tx.Delete(&cat).Error
-	})
-	if err != nil {
+	// A category with products keeps them: they're moved first.
+	if a.refuseIfUsed(c, "CATEGORY_IN_USE", inUseDetails{Entity: "category", Name: cat.NameEn, NameKm: cat.NameKm, Hint: hintMoveProducts},
+		countWhere("products", "products", "category_id = ? AND deleted_at IS NULL", id),
+	) {
+		return
+	}
+	if err := a.DB.Delete(&cat).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -210,19 +209,13 @@ func (a *API) DeleteSupplier(c *gin.Context) {
 		dbFail(c, err)
 		return
 	}
-	var pos int64
-	a.DB.Model(&models.PurchaseOrder{}).Where("supplier_id = ?", id).Count(&pos)
-	if pos > 0 {
-		fail(c, utils.NewAppError(http.StatusConflict, "SUPPLIER_IN_USE", "This supplier has purchase orders and can't be deleted."))
+	if a.refuseIfUsed(c, "SUPPLIER_IN_USE", inUseDetails{Entity: "supplier", Name: s.Name},
+		countWhere("purchase_orders", "purchase_orders", "supplier_id = ?", id),
+		countWhere("products", "products", "supplier_id = ? AND deleted_at IS NULL", id),
+	) {
 		return
 	}
-	err := a.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&models.Product{}).Where("supplier_id = ?", id).Update("supplier_id", nil).Error; err != nil {
-			return err
-		}
-		return tx.Delete(&s).Error
-	})
-	if err != nil {
+	if err := a.DB.Delete(&s).Error; err != nil {
 		dbFail(c, err)
 		return
 	}
@@ -667,10 +660,31 @@ func (a *API) DeleteProduct(c *gin.Context) {
 		dbFail(c, err)
 		return
 	}
-	// Soft delete: sales history keeps pointing at the product row. A
-	// parent's variants are meaningless on their own, so they're
-	// soft-deleted along with it — same "handle the children explicitly"
-	// pattern as category/supplier delete above.
+	// A product (or any of its variants) that was sold, bought, moved or
+	// counted, or is in stock, stays: it's switched off instead.
+	ids := []uint64{id}
+	if before.VariantCount > 0 {
+		var variants []uint64
+		if err := a.DB.Model(&models.Product{}).Where("parent_product_id = ?", id).Pluck("id", &variants).Error; err != nil {
+			dbFail(c, err)
+			return
+		}
+		ids = append(ids, variants...)
+	}
+	if a.refuseIfUsed(c, "PRODUCT_IN_USE", inUseDetails{Entity: "product", Name: before.NameEn, NameKm: before.NameKm, Hint: hintSwitchOff},
+		countDistinct("sales", "sale_items", "sale_id", "product_id IN ?", ids),
+		countDistinct("invoices", "invoice_items", "invoice_id", "product_id IN ?", ids),
+		countDistinct("purchase_orders", "purchase_order_items", "purchase_order_id", "product_id IN ?", ids),
+		countDistinct("table_orders", "table_order_items", "table_order_id", "product_id IN ?", ids),
+		countDistinct("stock_transfers", "stock_transfer_items", "stock_transfer_id", "product_id IN ?", ids),
+		countDistinct("stock_counts", "stock_count_items", "stock_count_id", "product_id IN ?", ids),
+		countWhere("stock_moves", "stock_movements", "product_id IN ?", ids),
+		countDistinct("stock", "branch_stock", "branch_id", "product_id IN ? AND qty <> 0", ids),
+	) {
+		return
+	}
+	// Soft delete. A parent's variants are meaningless on their own, so
+	// they're soft-deleted along with it.
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
 		if before.VariantCount > 0 {
 			if err := tx.Where("parent_product_id = ?", id).Delete(&models.Product{}).Error; err != nil {

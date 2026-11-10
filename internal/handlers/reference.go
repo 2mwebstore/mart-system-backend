@@ -149,10 +149,25 @@ func (a *API) DeleteBranch(c *gin.Context) {
 		dbFail(c, err)
 		return
 	}
-	var used int64
-	a.DB.Model(&models.Sale{}).Where("branch_id = ?", id).Count(&used)
-	if used > 0 {
-		fail(c, utils.NewAppError(http.StatusConflict, "BRANCH_IN_USE", "This branch has sales and can't be deleted — mark it inactive instead."))
+	// Anything that happened at the branch, or is set up there, keeps it.
+	if a.refuseIfUsed(c, "BRANCH_IN_USE", inUseDetails{Entity: "branch", Name: b.Name, Hint: hintSwitchOff},
+		countWhere("sales", "sales", "branch_id = ?", id),
+		countWhere("invoices", "invoices", "branch_id = ?", id),
+		countWhere("purchase_orders", "purchase_orders", "branch_id = ?", id),
+		countWhere("expenses", "expenses", "branch_id = ?", id),
+		countWhere("shifts", "shifts", "branch_id = ?", id),
+		countWhere("table_orders", "table_orders", "branch_id = ?", id),
+		countWhere("stock_transfers", "stock_transfers", "from_branch_id = ? OR to_branch_id = ?", id, id),
+		countWhere("stock_counts", "stock_counts", "branch_id = ?", id),
+		countWhere("stock_moves", "stock_movements", "branch_id = ?", id),
+		countWhere("stocked_products", "branch_stock", "branch_id = ? AND qty <> 0", id),
+		countWhere("tills", "devices", "branch_id = ?", id),
+		countWhere("tables", "dining_tables", "branch_id = ?", id),
+		// An Owner covers every branch, so their access here doesn't keep it.
+		countWhere("staff", "user_branches ub JOIN users u ON u.id = ub.user_id JOIN roles r ON r.id = COALESCE(ub.role_id, u.role_id)",
+			"ub.branch_id = ? AND r.name <> 'Owner'", id),
+		countWhere("roles", "roles", "branch_id = ? AND deleted_at IS NULL", id),
+	) {
 		return
 	}
 	if err := a.DB.Delete(&b).Error; err != nil {
@@ -285,13 +300,24 @@ func (a *API) DeleteDevice(c *gin.Context) {
 		dbFail(c, err)
 		return
 	}
-	var used int64
-	a.DB.Model(&models.Shift{}).Where("device_id = ?", id).Count(&used)
-	if used > 0 {
-		fail(c, utils.NewAppError(http.StatusConflict, "TILL_IN_USE", "This till has shift history and can't be deleted — mark it inactive instead."))
+	if a.refuseIfUsed(c, "TILL_IN_USE", inUseDetails{Entity: "till", Name: d.Name, Hint: hintSwitchOff},
+		countWhere("sales", "sales", "device_id = ?", id),
+		countWhere("shifts", "shifts", "device_id = ?", id),
+	) {
 		return
 	}
-	if err := a.DB.Delete(&d).Error; err != nil {
+	// Sign-ins at the till aren't history: they go with it (the database
+	// would otherwise refuse the delete).
+	err := a.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("device_id = ?", id).Delete(&models.RefreshToken{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("device_id = ?", id).Delete(&models.LoginAttempt{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&d).Error
+	})
+	if err != nil {
 		dbFail(c, err)
 		return
 	}

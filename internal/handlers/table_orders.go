@@ -235,6 +235,12 @@ func (a *API) DeleteDiningTable(c *gin.Context) {
 		fail(c, utils.ErrForbidden)
 		return
 	}
+	// A table that has taken orders keeps them; it's switched off instead.
+	if a.refuseIfUsed(c, "TABLE_IN_USE", inUseDetails{Entity: "table", Name: t.Name, Hint: hintSwitchOff},
+		countWhere("table_orders", "table_orders", "table_id = ?", id),
+	) {
+		return
+	}
 	if err := a.DB.Delete(&t).Error; err != nil {
 		dbFail(c, err)
 		return

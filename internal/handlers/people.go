@@ -141,6 +141,13 @@ func (a *API) DeleteCustomer(c *gin.Context) {
 		dbFail(c, err)
 		return
 	}
+	// A customer with sales or invoices stays with them.
+	if a.refuseIfUsed(c, "CUSTOMER_IN_USE", inUseDetails{Entity: "customer", Name: before.Name},
+		countWhere("sales", "sales", "customer_id = ?", id),
+		countWhere("invoices", "invoices", "customer_id = ?", id),
+	) {
+		return
+	}
 	// Soft delete; the unique phone index would otherwise block reusing the
 	// number, so free it up.
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
@@ -896,35 +903,28 @@ func (a *API) UpdateUser(c *gin.Context) {
 	utils.OK(c, http.StatusOK, after[0])
 }
 
-// userHasActivity reports whether the user has any transactional history —
-// sales, shifts, expenses, purchase orders, stock movements, cash movements,
-// void/refund approvals or a set exchange rate. Every one of these tables has
-// a FOREIGN KEY ... REFERENCES users(id) with no ON DELETE clause (i.e.
-// RESTRICT), so a hard delete would fail at the database anyway; this check
-// exists to give a clear, translatable reason instead of a raw MySQL error.
-func (a *API) userHasActivity(id uint64) (bool, error) {
-	checks := []struct{ table, column string }{
-		{"sales", "cashier_id"},
-		{"shifts", "user_id"},
-		{"expenses", "user_id"},
-		{"purchase_orders", "user_id"},
-		{"stock_movements", "user_id"},
-		{"cash_movements", "user_id"},
-		{"cash_movements", "approved_by_id"},
-		{"voids_refunds", "cashier_id"},
-		{"voids_refunds", "approved_by_id"},
-		{"exchange_rates", "set_by_user_id"},
+// userUses is everything that records who did it. A user is deleted for good
+// (the username can then be used again), and every one of these tables points
+// at users(id) with no ON DELETE clause, so the database would refuse anyway;
+// counting them first says why. Soft-deleted expenses count too: their rows
+// still point at the user.
+func userUses(id uint64) []usage {
+	return []usage{
+		countWhere("sales", "sales", "cashier_id = ?", id),
+		countWhere("shifts", "shifts", "user_id = ?", id),
+		countWhere("invoices", "invoices", "user_id = ?", id),
+		countWhere("invoice_payments", "invoice_payments", "user_id = ?", id),
+		countWhere("purchase_orders", "purchase_orders", "user_id = ?", id),
+		countWhere("expenses", "expenses", "user_id = ?", id),
+		countWhere("stock_moves", "stock_movements", "user_id = ?", id),
+		countWhere("stock_transfers", "stock_transfers", "user_id = ?", id),
+		countWhere("stock_counts", "stock_counts", "user_id = ?", id),
+		countWhere("cash_movements", "cash_movements", "user_id = ? OR approved_by_id = ?", id, id),
+		countWhere("voids_refunds", "voids_refunds", "cashier_id = ? OR approved_by_id = ?", id, id),
+		countWhere("exchange_rates", "exchange_rates", "set_by_user_id = ?", id),
+		countWhere("table_orders", "table_orders", "handled_by = ?", id),
+		countWhere("activity_log", "activity_logs", "user_id = ?", id),
 	}
-	for _, ch := range checks {
-		var count int64
-		if err := a.DB.Table(ch.table).Where(ch.column+" = ?", id).Count(&count).Error; err != nil {
-			return false, err
-		}
-		if count > 0 {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func (a *API) DeleteUser(c *gin.Context) {
@@ -955,13 +955,7 @@ func (a *API) DeleteUser(c *gin.Context) {
 		fail(c, err)
 		return
 	}
-	inUse, err := a.userHasActivity(id)
-	if err != nil {
-		dbFail(c, err)
-		return
-	}
-	if inUse {
-		fail(c, utils.NewAppError(http.StatusConflict, "USER_IN_USE", "This user has sales, shifts or other activity and can't be deleted. Deactivate the account instead."))
+	if a.refuseIfUsed(c, "USER_IN_USE", inUseDetails{Entity: "user", Name: beforeList[0].FullName, Hint: hintSwitchOff}, userUses(id)...) {
 		return
 	}
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
@@ -1322,7 +1316,10 @@ func (a *API) DeleteRole(c *gin.Context) {
 	}
 	// Counts everyone who holds it, at any branch.
 	if list[0].UserCount > 0 {
-		fail(c, utils.NewAppError(http.StatusConflict, "ROLE_IN_USE", "Reassign this role's users before deleting it."))
+		fail(c, inUseError("ROLE_IN_USE", inUseDetails{
+			Entity: "role", Name: list[0].Name, Hint: hintReassignUsers,
+			Uses: []use{{"staff", int64(list[0].UserCount)}},
+		}))
 		return
 	}
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
