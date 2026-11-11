@@ -24,7 +24,11 @@ FROM alpine:3.20
 # tzdata: APP_TIMEZONE (Asia/Phnom_Penh) needs the zoneinfo database.
 # mariadb-client: provides `mysqldump`, for the Settings > Alerts & Backup
 # "Backup now" button and the nightly scheduler (internal/services/backup_service.go).
-RUN apk add --no-cache ca-certificates tzdata mariadb-client \
+# mariadb-connector-c: the client's sign-in plugins. MySQL 8 and 9 sign users
+# in with caching_sha2_password, and Alpine's mariadb-client ships without it,
+# so without this every dump fails ("Plugin caching_sha2_password could not be
+# loaded"). tests/backup_image_test.sh checks a dump from the built image.
+RUN apk add --no-cache ca-certificates tzdata mariadb-client mariadb-connector-c \
  && adduser -D -H -u 10001 app \
  && mkdir -p /app/backups \
  && chown -R app:app /app

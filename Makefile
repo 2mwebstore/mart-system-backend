@@ -10,7 +10,7 @@ TEST_DB_PASSWORD=test-only-password
 
 MIGRATE_DSN=mysql://$(DB_USER):$(DB_PASSWORD)@tcp($(DB_HOST):$(DB_PORT))/$(DB_NAME)?charset=utf8mb4&collation=utf8mb4_unicode_ci&multiStatements=true
 
-.PHONY: run build test test-integration vet migrate-up migrate-down migrate-down-all migrate-new seed
+.PHONY: run build test test-integration test-backup-image vet migrate-up migrate-down migrate-down-all migrate-new seed
 
 run:
 	go run ./cmd/api
@@ -37,6 +37,12 @@ test-integration:
 		DB_PASSWORD=$(TEST_DB_PASSWORD) APP_ENV=test REQUIRE_TEST_DB=1 \
 		go test ./... -count=1 || status=$$?; \
 		docker rm -f $(TEST_DB_CONTAINER) >/dev/null; exit $$status
+
+# Builds the production image and checks its mysqldump can back up a MySQL
+# 8+ database (MYSQL_IMAGE=mysql:9.4 for another). Needs Docker.
+test-backup-image:
+	docker build -q -t mart-backend:backup-check .
+	IMAGE=mart-backend:backup-check sh tests/backup_image_test.sh
 
 vet:
 	go vet ./...
