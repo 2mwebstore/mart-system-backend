@@ -901,8 +901,21 @@ func csvCell(row []string, idx map[string]int, keys ...string) string {
 	return ""
 }
 
-// parseImportMoney reads a plain dollar amount ("1.50", "$1.50") into cents.
-func parseImportMoney(s string) (int64, error) {
+// parseImportMoney reads a plain amount of the company's main currency into
+// its minor unit: dollars ("1.50", "$1.50") into cents, or whole riel
+// ("1500", "1,500", "៛1,500") as they are. Riel has no decimal part.
+func parseImportMoney(s string, currency models.Currency) (int64, error) {
+	if currency == models.CurrencyKHR {
+		s = strings.ReplaceAll(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "៛")), ",", "")
+		if s == "" {
+			return 0, nil
+		}
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || n < 0 {
+			return 0, fmt.Errorf("invalid riel amount %q", s)
+		}
+		return n, nil
+	}
 	s = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "$"))
 	if s == "" {
 		return 0, nil
@@ -1011,6 +1024,7 @@ func (a *API) ImportProducts(c *gin.Context) {
 
 	var categories []models.Category
 	a.DB.Where("company_id = ?", companyOf(c)).Find(&categories)
+	currency := a.mainCurrency(companyOf(c)) // what the cost and price columns are in
 	catByName := make(map[string]uint64, len(categories))
 	catByID := make(map[uint64]bool, len(categories))
 	for _, cat := range categories {
@@ -1115,10 +1129,14 @@ func (a *API) ImportProducts(c *gin.Context) {
 			result.Skipped = append(result.Skipped, importRowError{rowNum, "Price is required."})
 			continue
 		}
-		cost, costErr := parseImportMoney(csvCell(row, idx, "cost"))
-		price, priceErr := parseImportMoney(csvCell(row, idx, "price"))
+		cost, costErr := parseImportMoney(csvCell(row, idx, "cost"), currency)
+		price, priceErr := parseImportMoney(csvCell(row, idx, "price"), currency)
 		if costErr != nil || priceErr != nil {
-			result.Skipped = append(result.Skipped, importRowError{rowNum, "Cost and price must be plain numbers, e.g. 1.50."})
+			msg := "Cost and price must be plain numbers, e.g. 1.50."
+			if currency == models.CurrencyKHR {
+				msg = "Cost and price must be whole riel, e.g. 1500."
+			}
+			result.Skipped = append(result.Skipped, importRowError{rowNum, msg})
 			continue
 		}
 		reorder, reorderErr := parseImportInt(csvCell(row, idx, "reorder_point", "reorder"))

@@ -300,9 +300,10 @@ func (a *API) CreateExpense(c *gin.Context) {
 	a.audit(c, "expenses", "expense.create", "expense", e.ID, nil, req)
 	dto, _ := a.getExpense(e.ID)
 	if dto != nil {
-		amount := services.FormatUSD(e.AmountCents)
+		cur := a.mainCurrency(companyOf(c))
+		amount := services.FormatMoney(e.AmountCents, cur)
 		if e.TaxCents > 0 {
-			amount = fmt.Sprintf("%s (%s %s)", services.FormatUSD(e.AmountCents+e.TaxCents), services.HTMLEscape(e.TaxName), services.FormatUSD(e.TaxCents))
+			amount = fmt.Sprintf("%s (%s %s)", services.FormatMoney(e.AmountCents+e.TaxCents, cur), services.HTMLEscape(e.TaxName), services.FormatMoney(e.TaxCents, cur))
 		}
 		a.Notify.Send(companyOf(c), services.AlertExpenseAdded, fmt.Sprintf("💸 <b>Expense added</b>\n%s · %s\n%s", services.HTMLEscape(string(e.Category)), amount, services.HTMLEscape(utils.RichTextPlain(e.Note))))
 	}

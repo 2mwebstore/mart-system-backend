@@ -74,9 +74,15 @@ type companyDTO struct {
 	ActiveUserCount   int64 `json:"active_user_count"`
 	MaxUsers          *int  `json:"max_users"`
 	// RetentionMonths is how long the company keeps its activity log.
-	RetentionMonths int               `json:"retention_months" gorm:"-"`
-	Owners          []companyOwnerDTO `json:"owners" gorm:"-"`
-	CreatedAt       time.Time         `json:"created_at"`
+	RetentionMonths int `json:"retention_months" gorm:"-"`
+	// ShiftMode is whether it works in shifts: REQUIRED or SKIP (see settingsDTO).
+	ShiftMode string `json:"shift_mode" gorm:"-"`
+	// MainCurrency is what it prices and sells in: USD or KHR (see
+	// currency.go). Locked once it has amounts stored in it.
+	MainCurrency       string            `json:"main_currency" gorm:"-"`
+	MainCurrencyLocked bool              `json:"main_currency_locked" gorm:"-"`
+	Owners             []companyOwnerDTO `json:"owners" gorm:"-"`
+	CreatedAt          time.Time         `json:"created_at"`
 }
 
 // loadCompanies is every company, or just onlyID, with how many branches and
@@ -116,8 +122,35 @@ func (a *API) loadCompanies(onlyID uint64) ([]companyDTO, error) {
 	for _, o := range owners {
 		byCompany[o.CompanyID] = append(byCompany[o.CompanyID], companyOwnerDTO{ID: o.ID, FullName: o.FullName, Username: o.Username, Active: o.Active})
 	}
+	var modes []models.CompanySetting
+	mq := a.DB.Where("`key` IN ?", []string{settingShiftMode, settingMainCurrency})
+	if onlyID != 0 {
+		mq = mq.Where("company_id = ?", onlyID)
+	}
+	if err := mq.Find(&modes).Error; err != nil {
+		return nil, err
+	}
+	modeOf, currencyOf := map[uint64]string{}, map[uint64]string{}
+	for _, m := range modes {
+		if m.Key == settingMainCurrency {
+			currencyOf[m.CompanyID] = m.Value
+		} else {
+			modeOf[m.CompanyID] = m.Value
+		}
+	}
+	ids := make([]uint64, len(companies))
+	for i := range companies {
+		ids[i] = companies[i].ID
+	}
+	locked, err := companiesWithMoney(a.DB, ids)
+	if err != nil {
+		return nil, err
+	}
 	for i := range companies {
 		companies[i].RetentionMonths = a.Backup.LoadActivityLogRetentionMonths(companies[i].ID)
+		companies[i].ShiftMode = shiftModeOf(modeOf[companies[i].ID])
+		companies[i].MainCurrency = string(mainCurrencyOf(currencyOf[companies[i].ID]))
+		companies[i].MainCurrencyLocked = locked[companies[i].ID]
 		companies[i].Owners = byCompany[companies[i].ID]
 		if companies[i].Owners == nil {
 			companies[i].Owners = []companyOwnerDTO{}
@@ -176,11 +209,16 @@ type createCompanyReq struct {
 	// No limit when left out.
 	MaxBranches *int `json:"max_branches" binding:"omitempty,min=1,max=100000"`
 	MaxUsers    *int `json:"max_users" binding:"omitempty,min=1,max=100000"`
+	// How its tills start selling; REQUIRED when left out.
+	ShiftMode string `json:"shift_mode" binding:"omitempty,oneof=REQUIRED SKIP"`
+	// What it prices and sells in; USD when left out.
+	MainCurrency string `json:"main_currency" binding:"omitempty,oneof=USD KHR"`
 }
 
 // CreateCompany makes a company ready to use: its default roles, numbering
-// and payment methods, and its first Owner, who signs in and sets up the
-// branches, tills, staff and catalog.
+// and payment methods, how its tills start selling, its main currency, and
+// its first Owner, who signs in and sets up the branches, tills, staff and
+// catalog.
 func (a *API) CreateCompany(c *gin.Context) {
 	var req createCompanyReq
 	if !bind(c, &req) {
@@ -212,6 +250,14 @@ func (a *API) CreateCompany(c *gin.Context) {
 		if err != nil {
 			return err
 		}
+		currency := mainCurrencyOf(req.MainCurrency)
+		if err := saveCompanySettings(tx, company.ID, map[string]string{settingShiftMode: shiftModeOf(req.ShiftMode), settingMainCurrency: string(currency)}); err != nil {
+			return err
+		}
+		// The default roles' refund limits are dollar amounts.
+		if err := convertRefundLimits(tx, company.ID, models.CurrencyUSD, currency, a.currentRate(company.ID)); err != nil {
+			return err
+		}
 		owner := models.User{
 			CompanyID: &company.ID, FullName: req.OwnerFullName, Username: strings.ToLower(strings.TrimSpace(req.OwnerUsername)),
 			RoleID: roles[models.RoleOwner].ID, PasswordHash: pw, Active: true,
@@ -232,6 +278,7 @@ func (a *API) CreateCompany(c *gin.Context) {
 	}
 	a.auditIn(c, company.ID, "platform", "company.create", "company", company.ID, nil, gin.H{
 		"name": company.Name, "code": company.Code, "owner": req.OwnerUsername, "max_branches": req.MaxBranches, "max_users": req.MaxUsers,
+		"shift_mode": shiftModeOf(req.ShiftMode), "main_currency": mainCurrencyOf(req.MainCurrency),
 	})
 	out, err := a.loadCompanies(company.ID)
 	if err != nil || len(out) == 0 {
@@ -251,12 +298,19 @@ type updateCompanyReq struct {
 	// How long the company keeps its activity log. Only the super admin sets
 	// it; the company's Owner sees it.
 	RetentionMonths int `json:"retention_months" binding:"required,oneof=1 2 3"`
+	// How its tills start selling; left out keeps it as it is.
+	ShiftMode string `json:"shift_mode" binding:"omitempty,oneof=REQUIRED SKIP"`
+	// What it prices and sells in; left out keeps it. It can only change
+	// while the company has no amounts stored (MAIN_CURRENCY_LOCKED).
+	MainCurrency string `json:"main_currency" binding:"omitempty,oneof=USD KHR"`
 }
 
 // UpdateCompany renames a company, changes its code, turns it on or off,
-// sets its limits and how long it keeps its activity log. Every field is the
-// new value. Turning it off signs every one of its users out and keeps them
-// out: their next request is refused and they can't sign in.
+// sets its limits, how long it keeps its activity log, whether it works in
+// shifts and its main currency. Every field is the new value (a shift mode or
+// currency left out is kept). Turning it off signs every one of its users
+// out and keeps them out: their next request is refused and they can't sign
+// in.
 func (a *API) UpdateCompany(c *gin.Context) {
 	id, ok := idParam(c)
 	if !ok {
@@ -283,6 +337,12 @@ func (a *API) UpdateCompany(c *gin.Context) {
 		return
 	}
 	retentionBefore := a.Backup.LoadActivityLogRetentionMonths(id)
+	shiftModeBefore := shiftModeOf(a.companySettings(id, settingShiftMode)[settingShiftMode])
+	currencyBefore := a.mainCurrency(id)
+	currencyAfter := currencyBefore
+	if req.MainCurrency != "" {
+		currencyAfter = mainCurrencyOf(req.MainCurrency)
+	}
 	err := a.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&models.Company{}).Where("id = ?", id).Updates(map[string]interface{}{
 			"name": strings.TrimSpace(req.Name), "code": code, "active": req.Active,
@@ -293,11 +353,34 @@ func (a *API) UpdateCompany(c *gin.Context) {
 		if err := services.SaveActivityLogRetentionMonths(tx, id, req.RetentionMonths); err != nil {
 			return err
 		}
+		if req.ShiftMode != "" {
+			if err := saveCompanySettings(tx, id, map[string]string{settingShiftMode: req.ShiftMode}); err != nil {
+				return err
+			}
+		}
+		if currencyAfter != currencyBefore {
+			// Checked in the transaction, so a first sale can't slip in.
+			if withMoney, err := companiesWithMoney(tx, []uint64{id}); err != nil {
+				return err
+			} else if withMoney[id] {
+				return errMainCurrencyLocked
+			}
+			if err := saveCompanySettings(tx, id, map[string]string{settingMainCurrency: string(currencyAfter)}); err != nil {
+				return err
+			}
+			if err := convertRefundLimits(tx, id, currencyBefore, currencyAfter, a.currentRate(id)); err != nil {
+				return err
+			}
+		}
 		if before.Active && !req.Active {
 			return endCompanySessions(tx, id)
 		}
 		return nil
 	})
+	if errors.Is(err, errMainCurrencyLocked) {
+		fail(c, errMainCurrencyLocked)
+		return
+	}
 	if err != nil {
 		dbFail(c, err)
 		return
@@ -310,6 +393,7 @@ func (a *API) UpdateCompany(c *gin.Context) {
 	a.auditIn(c, id, "platform", "company.update", "company", id, gin.H{
 		"name": before.Name, "code": before.Code, "active": before.Active,
 		"max_branches": before.MaxBranches, "max_users": before.MaxUsers, "retention_months": retentionBefore,
+		"shift_mode": shiftModeBefore, "main_currency": currencyBefore,
 	}, req)
 	utils.OK(c, http.StatusOK, out[0])
 }

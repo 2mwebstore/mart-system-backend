@@ -65,7 +65,7 @@ func TestManagerCantReachAnotherBranch(t *testing.T) {
 		} {
 			wantStatus(t, call(t, http.MethodGet, path+"?branch_id="+bkk, token, nil), http.StatusForbidden)
 		}
-		for _, path := range []string{"/sales/" + id(res.sale), "/invoices/" + id(res.invoice)} {
+		for _, path := range []string{"/sales/" + id(res.sale), "/invoices/" + id(res.invoice), "/purchase-orders/" + id(res.purchaseOrder)} {
 			r := call(t, http.MethodGet, path, token, nil)
 			if r.Status != http.StatusForbidden && r.Status != http.StatusNotFound {
 				t.Errorf("GET %s: %s", path, r)
@@ -123,7 +123,19 @@ func TestManagerCantReachAnotherBranch(t *testing.T) {
 		if n := dbInt(t, "SELECT COUNT(*) FROM purchase_orders WHERE id = ?", res.purchaseOrder); n != 1 {
 			t.Fatal("a manager from another branch deleted it")
 		}
-		wantStatus(t, call(t, http.MethodDelete, "/purchase-orders/"+id(res.purchaseOrder), login(t, e.managerBKK).Access, nil), http.StatusOK)
+		// Its own branch's manager opens it on its own (the edit page does);
+		// another company's Owner can't.
+		bkkManager := login(t, e.managerBKK).Access
+		r := call(t, http.MethodGet, "/purchase-orders/"+id(res.purchaseOrder), bkkManager, nil)
+		wantStatus(t, r, http.StatusOK)
+		if items, _ := r.field(t, "items").([]interface{}); len(items) != 1 || r.field(t, "code") == "" {
+			t.Fatalf("the order as read: %s", r)
+		}
+		if r := call(t, http.MethodGet, "/purchase-orders/"+id(res.purchaseOrder), login(t, e.b.owner).Access, nil); r.Status != http.StatusForbidden {
+			t.Fatalf("another company read it: %s", r)
+		}
+		wantStatus(t, call(t, http.MethodGet, "/purchase-orders/999999999", bkkManager, nil), http.StatusNotFound)
+		wantStatus(t, call(t, http.MethodDelete, "/purchase-orders/"+id(res.purchaseOrder), bkkManager, nil), http.StatusOK)
 	})
 }
 

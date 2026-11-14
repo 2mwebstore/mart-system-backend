@@ -627,7 +627,7 @@ func (a *API) firstInvoicePayment(tx *gorm.DB, inv *models.Invoice, req invoiceP
 		return utils.NewValidationError(map[string]string{"attachment": "The proof must be an image or a web link (up to about 2 MB)."})
 	}
 	if req.AmountCents > inv.TotalCents {
-		return utils.NewAppError(http.StatusUnprocessableEntity, "PAYMENT_OVER_BALANCE", fmt.Sprintf("That's more than the %s still owed.", formatCents(inv.TotalCents)))
+		return utils.NewAppError(http.StatusUnprocessableEntity, "PAYMENT_OVER_BALANCE", fmt.Sprintf("That's more than the %s still owed.", a.formatBranchMoney(inv.BranchID, inv.TotalCents)))
 	}
 	p := models.InvoicePayment{
 		InvoiceID: inv.ID, PaidOn: paidOn, MethodName: strings.TrimSpace(req.MethodName), MethodType: req.MethodType,
@@ -702,7 +702,7 @@ func (a *API) AddInvoicePayment(c *gin.Context) {
 			return utils.NewAppError(http.StatusConflict, "INVOICE_PAID", "This invoice is already paid in full.")
 		}
 		if req.AmountCents > balance {
-			return utils.NewAppError(http.StatusUnprocessableEntity, "PAYMENT_OVER_BALANCE", fmt.Sprintf("That's more than the %s still owed.", formatCents(balance)))
+			return utils.NewAppError(http.StatusUnprocessableEntity, "PAYMENT_OVER_BALANCE", fmt.Sprintf("That's more than the %s still owed.", a.formatBranchMoney(inv.BranchID, balance)))
 		}
 		p := models.InvoicePayment{
 			InvoiceID: id, PaidOn: paidOn, MethodName: strings.TrimSpace(req.MethodName), MethodType: req.MethodType,
@@ -777,6 +777,7 @@ func (a *API) DeleteInvoicePayment(c *gin.Context) {
 	utils.OK(c, http.StatusOK, out)
 }
 
-func formatCents(c int64) string {
-	return fmt.Sprintf("$%d.%02d", c/100, c%100)
+// formatBranchMoney is an amount in the main currency of the branch's company.
+func (a *API) formatBranchMoney(branchID uint64, amount int64) string {
+	return services.FormatMoney(amount, a.mainCurrency(a.branchCompany(branchID)))
 }

@@ -39,6 +39,8 @@ type brandingDTO struct {
 	HasLogo     bool   `json:"has_logo"`
 	LogoLink    string `json:"logo_link"`    // set when the logo is a web link
 	LogoVersion string `json:"logo_version"` // changes whenever an uploaded logo changes (cache key)
+	// The line under every page, the same for every company (see footer.go).
+	FooterText string `json:"footer_text"`
 }
 
 // brandingSettings is a company's name and logo as set on Settings. The name
@@ -84,7 +86,9 @@ func toBrandingDTO(name, logo string) brandingDTO {
 // GetBranding is public: company name and how to show the logo.
 func (a *API) GetBranding(c *gin.Context) {
 	name, logo := a.brandingSettings(a.publicBrandingCompany(c))
-	utils.OK(c, http.StatusOK, toBrandingDTO(name, logo))
+	out := toBrandingDTO(name, logo)
+	out.FooterText = a.footerText()
+	utils.OK(c, http.StatusOK, out)
 }
 
 // GetBrandingLogo serves an uploaded logo as an image. With ?v=<version> the
@@ -196,5 +200,7 @@ func (a *API) UpdateBranding(c *gin.Context) {
 		before["receipt_header"], after["receipt_header"] = header, name
 	}
 	a.audit(c, "settings", "settings.branding", "settings", 0, before, after)
-	utils.OK(c, http.StatusOK, toBrandingDTO(name, logo))
+	out := toBrandingDTO(name, logo)
+	out.FooterText = a.footerText()
+	utils.OK(c, http.StatusOK, out)
 }

@@ -445,6 +445,17 @@ type settingsDTO struct {
 	// TaxDefaults is the tax rate each place starts with. Like the default
 	// customer it's only read here; PUT /tax-rates/defaults writes it.
 	TaxDefaults taxDefaultsDTO `json:"tax_defaults"`
+	// MainCurrency is the company's own currency, "USD" or "KHR": every
+	// *_cents amount (prices, totals, invoices, expenses, reports) is in its
+	// minor unit, cents or whole riel. Only read here; the super admin sets
+	// it on the company (POST/PUT /platform/companies), see currency.go.
+	MainCurrency string `json:"main_currency"`
+	// ShiftMode is whether the company works in shifts: "REQUIRED", the
+	// cashier opens and closes a shift with a cash count, or "SKIP", no shifts
+	// (the till opens one by itself with nothing counted and keeps it; the
+	// admin app shows nothing about shifts). Only read here; the super admin
+	// sets it on the company (POST/PUT /platform/companies).
+	ShiftMode string `json:"shift_mode"`
 }
 
 const (
@@ -453,7 +464,23 @@ const (
 	settingLoyalty         = "loyalty_points_per_usd"
 	settingAllowOOS        = "allow_out_of_stock_sale"
 	settingDefaultCustomer = "pos_default_customer_id"
+	settingMainCurrency    = "main_currency"
+	settingShiftMode       = "pos_shift_mode"
 )
+
+// Whether a company works in shifts (settingShiftMode).
+const (
+	shiftModeRequired = "REQUIRED"
+	shiftModeSkip     = "SKIP"
+)
+
+// shiftModeOf is a stored shift mode as the API gives it: SKIP only when set.
+func shiftModeOf(stored string) string {
+	if stored == shiftModeSkip {
+		return shiftModeSkip
+	}
+	return shiftModeRequired
+}
 
 // companySettings reads a company's own settings: every one but the logo
 // (served on its own), or just keys when given.
@@ -505,6 +532,8 @@ func (a *API) loadSettings(companyID uint64) settingsDTO {
 		ReceiptHeader: header, ReceiptFooter: m[settingReceiptFooter], LoyaltyPointsPerUSD: loyalty,
 		AllowOutOfStockSale: m[settingAllowOOS] == "true",
 		TaxDefaults:         a.taxDefaults(companyID, m),
+		MainCurrency:        string(mainCurrencyOf(m[settingMainCurrency])),
+		ShiftMode:           shiftModeOf(m[settingShiftMode]),
 	}
 	// Only while that customer is still the company's: one deleted since (or
 	// wiped by a production reset) leaves the POS on walk-in.

@@ -603,6 +603,12 @@ func (a *API) ByCashierReport(c *gin.Context) {
 	branchID := branchParam(c)
 	pg := pagerOf(c)
 	from, to := dateRange(c)
+	// A shift's cash difference is counted per currency; it's added up in
+	// the company's main currency at the shift's own rate.
+	cashDiff := "sh.diff_usd_cents + ROUND(sh.diff_khr_riel * 100 / NULLIF(sh.exchange_rate,0))"
+	if a.mainCurrency(companyOf(c)) == models.CurrencyKHR {
+		cashDiff = "sh.diff_khr_riel + ROUND(sh.diff_usd_cents * sh.exchange_rate / 100)"
+	}
 	type row struct {
 		ID             uint64 `json:"id"`
 		Name           string `json:"name"`
@@ -621,7 +627,7 @@ func (a *API) ByCashierReport(c *gin.Context) {
 			(SELECT COUNT(*) FROM sales s WHERE s.cashier_id = u.id AND s.branch_id = ? AND s.status='PAID' AND s.sold_at >= ? AND s.sold_at < ?) AS transactions,
 			(SELECT COUNT(*) FROM voids_refunds vr JOIN sales s ON s.id = vr.sale_id WHERE vr.cashier_id = u.id AND vr.type='VOID' AND s.branch_id = ? AND vr.created_at >= ? AND vr.created_at < ?) AS voids,
 			(SELECT COUNT(*) FROM voids_refunds vr JOIN sales s ON s.id = vr.sale_id WHERE vr.cashier_id = u.id AND vr.type='REFUND' AND s.branch_id = ? AND vr.created_at >= ? AND vr.created_at < ?) AS refunds,
-			COALESCE((SELECT SUM(sh.diff_usd_cents + ROUND(sh.diff_khr_riel * 100 / NULLIF(sh.exchange_rate,0))) FROM shifts sh WHERE sh.user_id = u.id AND sh.branch_id = ? AND sh.status='CLOSED' AND sh.opened_at >= ? AND sh.opened_at < ?),0) AS cash_diff_cents
+			COALESCE((SELECT SUM(`+cashDiff+`) FROM shifts sh WHERE sh.user_id = u.id AND sh.branch_id = ? AND sh.status='CLOSED' AND sh.opened_at >= ? AND sh.opened_at < ?),0) AS cash_diff_cents
 		FROM users u
 		WHERE u.deleted_at IS NULL AND u.id IN (SELECT cashier_id FROM sales WHERE branch_id = ?
 			UNION SELECT user_id FROM shifts WHERE branch_id = ?)

@@ -338,6 +338,7 @@ func (a *API) CreateSale(c *gin.Context) {
 	rate := a.currentRate(companyOf(c))
 	appSettings := a.loadSettings(companyOf(c))
 	loyaltyRate := appSettings.LoyaltyPointsPerUSD
+	currency := appSettings.MainCurrency // the company's own: every amount below is in it
 	// Store-wide, not per-product (see docs/DECISIONS.md) — read once here,
 	// same as the rate and loyalty settings above, rather than per line.
 	allowOOS := appSettings.AllowOutOfStockSale
@@ -445,9 +446,9 @@ func (a *API) CreateSale(c *gin.Context) {
 			}
 		}
 
-		pay := models.Payment{Method: models.PaymentMethod(req.Payment.Method), Currency: models.CurrencyUSD, AmountCents: total, AmountRiel: utils.USDCentsToRiel(total, rate), Reference: req.Payment.Reference, Status: models.PaymentConfirmed, CreatedAt: time.Now()}
+		pay := models.Payment{Method: models.PaymentMethod(req.Payment.Method), Currency: models.Currency(currency), AmountCents: total, AmountRiel: utils.RielIn(currency, total, rate), Reference: req.Payment.Reference, Status: models.PaymentConfirmed, CreatedAt: time.Now()}
 		if req.Payment.Method == "CASH" {
-			res, err := utils.CalculateChange(total, req.Payment.ReceivedUSDCents, req.Payment.ReceivedKHRRiel, rate)
+			res, err := utils.CalculateChangeIn(currency, total, req.Payment.ReceivedUSDCents, req.Payment.ReceivedKHRRiel, rate)
 			if err != nil {
 				return err
 			}
@@ -467,7 +468,7 @@ func (a *API) CreateSale(c *gin.Context) {
 		sale := models.Sale{
 			BranchID: device.BranchID, ShiftID: shift.ID, DeviceID: device.ID, CashierID: userID, CustomerID: req.CustomerID,
 			ReceiptNo: receiptNo, BusinessDate: businessDate, Status: models.SalePaid,
-			SubtotalCents: subtotal, DiscountCents: totalDiscount, TotalCents: total, TotalRiel: utils.USDCentsToRiel(total, rate),
+			SubtotalCents: subtotal, DiscountCents: totalDiscount, TotalCents: total, TotalRiel: utils.RielIn(currency, total, rate),
 			ExchangeRate: rate, CostTotalCents: cost, IdempotencyKey: req.IdempotencyKey, SoldAt: now,
 			TaxSnapshot: taxSnap, Note: utils.SanitizeRichText(req.Note),
 		}
@@ -498,7 +499,7 @@ func (a *API) CreateSale(c *gin.Context) {
 			return err
 		}
 		if req.CustomerID != nil && loyaltyRate > 0 {
-			points := int64(math.Floor(float64(total) / 100 * loyaltyRate))
+			points := int64(math.Floor(float64(total) / float64(utils.LoyaltyUnit(currency)) * loyaltyRate))
 			if points > 0 {
 				if err := tx.Model(&models.Customer{}).Where("id = ?", *req.CustomerID).Update("points", gorm.Expr("points + ?", points)).Error; err != nil {
 					return err
@@ -534,7 +535,7 @@ func (a *API) CreateSale(c *gin.Context) {
 	}
 	a.Notify.Send(companyOf(c), services.AlertSaleCompleted, fmt.Sprintf(
 		"🧾 <b>Sale completed</b>\n%s · %s\n%s\nTotal: %s",
-		sale.ReceiptNo, services.HTMLEscape(sale.Cashier), services.FormatItemLines(itemLines, 12), services.FormatUSD(sale.TotalCents),
+		sale.ReceiptNo, services.HTMLEscape(sale.Cashier), services.FormatItemLines(itemLines, 12), services.FormatMoney(sale.TotalCents, models.Currency(currency)),
 	))
 	utils.OK(c, http.StatusCreated, out[0])
 }
@@ -757,7 +758,8 @@ func (a *API) EditSale(c *gin.Context) {
 
 		// Keep the sale's own exchange rate — an edit corrects what was rung
 		// up, it doesn't re-price the sale at today's rate.
-		totalRiel := utils.USDCentsToRiel(total, sale.ExchangeRate)
+		currency := string(a.mainCurrency(companyOf(c)))
+		totalRiel := utils.RielIn(currency, total, sale.ExchangeRate)
 		if err := tx.Model(&models.Sale{}).Where("id = ?", id).Updates(map[string]interface{}{
 			"subtotal_cents": subtotal, "discount_cents": totalDiscount, "total_cents": total, "total_riel": totalRiel, "cost_total_cents": cost,
 			"tax_cents": saleTax.TaxCents,
@@ -787,7 +789,7 @@ func (a *API) EditSale(c *gin.Context) {
 			"received_usd_cents": int64(0), "received_khr_riel": int64(0), "change_usd_cents": int64(0), "change_khr_riel": int64(0),
 		}
 		if method == models.PaymentCash {
-			res, err := utils.CalculateChange(total, recvUSD, recvKHR, sale.ExchangeRate)
+			res, err := utils.CalculateChangeIn(currency, total, recvUSD, recvKHR, sale.ExchangeRate)
 			if err != nil {
 				return err
 			}
@@ -809,7 +811,7 @@ func (a *API) EditSale(c *gin.Context) {
 			loyaltyRate := a.loadSettings(companyOf(c)).LoyaltyPointsPerUSD
 			newPoints := int64(0)
 			if loyaltyRate > 0 {
-				newPoints = int64(math.Floor(float64(total) / 100 * loyaltyRate))
+				newPoints = int64(math.Floor(float64(total) / float64(utils.LoyaltyUnit(currency)) * loyaltyRate))
 			}
 			delta := newPoints - earned
 			if delta != 0 {
@@ -952,7 +954,7 @@ func (a *API) VoidSale(c *gin.Context) {
 		}
 		a.Notify.Send(companyOf(c), services.AlertVoidRefund, fmt.Sprintf(
 			"🚫 <b>Sale voided</b>\n%s · %s\n%s\nTotal: %s\nReason: %s",
-			sale.ReceiptNo, services.HTMLEscape(sale.Cashier), services.FormatItemLines(itemLines, 12), services.FormatUSD(sale.TotalCents), services.HTMLEscape(req.Reason),
+			sale.ReceiptNo, services.HTMLEscape(sale.Cashier), services.FormatItemLines(itemLines, 12), services.FormatMoney(sale.TotalCents, a.mainCurrency(companyOf(c))), services.HTMLEscape(req.Reason),
 		))
 	}
 	utils.OK(c, http.StatusOK, out[0])

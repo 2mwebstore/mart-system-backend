@@ -97,6 +97,28 @@ func FormatUSD(cents int64) string {
 	return neg + "$" + strconv.FormatInt(cents/100, 10) + "." + fmt.Sprintf("%02d", cents%100)
 }
 
+// FormatMoney renders an amount in a company's main currency for alert and
+// error text: cents as FormatUSD does, or whole riel as "៛15,600".
+func FormatMoney(amount int64, currency models.Currency) string {
+	if currency != models.CurrencyKHR {
+		return FormatUSD(amount)
+	}
+	neg := ""
+	if amount < 0 {
+		neg = "-"
+		amount = -amount
+	}
+	digits := strconv.FormatInt(amount, 10)
+	var b strings.Builder
+	for i, d := range digits {
+		if i > 0 && (len(digits)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(d)
+	}
+	return neg + "៛" + b.String()
+}
+
 var telegramKeys = []string{settingTelegramEnabled, settingTelegramToken, settingTelegramChatID, settingTelegramAlerts}
 
 // LoadSettings is a company's Telegram settings, or the install's for 0.

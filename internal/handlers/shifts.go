@@ -407,7 +407,7 @@ func (a *API) CloseShift(c *gin.Context) {
 	a.Notify.Send(companyOf(c), services.AlertShiftClosed, fmt.Sprintf(
 		"🔒 <b>Shift closed</b>\n%s · %s\nGross sales: %s\nDiff: %s (%s / ៛%d)",
 		services.HTMLEscape(final.DeviceName), services.HTMLEscape(final.CashierName),
-		services.FormatUSD(final.GrossSalesCents), status, services.FormatUSD(final.DiffUSDCents), final.DiffKHRRiel,
+		services.FormatMoney(final.GrossSalesCents, a.mainCurrency(companyOf(c))), status, services.FormatUSD(final.DiffUSDCents), final.DiffKHRRiel,
 	))
 	utils.OK(c, http.StatusOK, final)
 }

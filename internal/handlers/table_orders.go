@@ -325,7 +325,8 @@ func (a *API) PublicTableMenu(c *gin.Context) {
 		"table":         gin.H{"name": table.Name},
 		"branch":        gin.H{"name": branch.Name},
 		"store_name":    a.loadSettings(branch.CompanyID).ReceiptHeader,
-		"exchange_rate": a.currentRate(branch.CompanyID), // riel per USD, for showing totals in both
+		"exchange_rate": a.currentRate(branch.CompanyID),  // riel per USD, for showing totals in both
+		"currency":      a.mainCurrency(branch.CompanyID), // what the prices are in: USD (cents) or KHR (riel)
 		"items":         items,
 	})
 }
@@ -489,7 +490,7 @@ func (a *API) PlacePublicTableOrder(c *gin.Context) {
 		lines[i] = fmt.Sprintf("%d× %s", it.Qty, services.HTMLEscape(it.NameEn))
 	}
 	a.Notify.Send(branch.CompanyID, services.AlertTableOrder, fmt.Sprintf("🍽 <b>New table order</b>\n%s · %s\n%s\nTotal: %s",
-		services.HTMLEscape(table.Name), services.HTMLEscape(branch.Name), services.FormatItemLines(lines, 12), services.FormatUSD(total)))
+		services.HTMLEscape(table.Name), services.HTMLEscape(branch.Name), services.FormatItemLines(lines, 12), services.FormatMoney(total, a.mainCurrency(branch.CompanyID))))
 
 	out, err := a.publicOrder(o)
 	if err != nil {

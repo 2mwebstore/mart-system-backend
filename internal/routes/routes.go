@@ -174,6 +174,7 @@ func Setup(deps Dependencies) *gin.Engine {
 		authed.GET("/stock-movements", perm("inventory.view"), api.ListStockMovements)
 
 		authed.GET("/purchase-orders", perm("purchase_order.view"), api.ListPurchaseOrders)
+		authed.GET("/purchase-orders/:id", perm("purchase_order.view"), api.GetPurchaseOrder)
 		authed.POST("/purchase-orders", perm("purchase_order.create"), api.CreatePurchaseOrder)
 		authed.PUT("/purchase-orders/:id", perm("purchase_order.update"), api.UpdatePurchaseOrder)
 		authed.DELETE("/purchase-orders/:id", perm("purchase_order.delete"), api.DeletePurchaseOrder)
@@ -266,6 +267,9 @@ func Setup(deps Dependencies) *gin.Engine {
 		platform.GET("/settings/notifications", api.GetPlatformNotifySettings)
 		platform.PUT("/settings/notifications", api.UpdatePlatformNotifySettings)
 		platform.POST("/settings/notifications/test", api.SendTestAlert)
+		// The line under every page, for every company (a copyright).
+		platform.GET("/settings/footer", api.GetFooter)
+		platform.PUT("/settings/footer", api.UpdateFooter)
 
 		platform.GET("/backups", api.ListBackups)
 		platform.PUT("/backups/settings", api.UpdateBackupSettings)

@@ -335,6 +335,29 @@ func (a *API) ownProducts(c *gin.Context, ids []uint64) bool {
 	return true
 }
 
+// GetPurchaseOrder is one order with its lines: the edit page opens it at its
+// own address.
+func (a *API) GetPurchaseOrder(c *gin.Context) {
+	id, ok := idParam(c)
+	if !ok {
+		return
+	}
+	out, err := a.loadPOs(0, id)
+	if err != nil {
+		dbFail(c, err)
+		return
+	}
+	if len(out) == 0 {
+		fail(c, utils.ErrNotFound)
+		return
+	}
+	if !canAccessBranch(c, out[0].BranchID) {
+		fail(c, utils.ErrForbidden)
+		return
+	}
+	utils.OK(c, http.StatusOK, out[0])
+}
+
 func (a *API) CreatePurchaseOrder(c *gin.Context) { a.savePO(c, 0) }
 
 func (a *API) UpdatePurchaseOrder(c *gin.Context) {
@@ -438,7 +461,7 @@ func (a *API) ReceivePurchaseOrder(c *gin.Context) {
 		}
 		a.Notify.Send(companyOf(c), services.AlertPOReceived, fmt.Sprintf(
 			"📦 <b>Purchase order received</b>\n%s · %s\n%s\nTotal: %s",
-			po.Code, services.HTMLEscape(po.SupplierName), services.FormatItemLines(itemLines, 12), services.FormatUSD(total),
+			po.Code, services.HTMLEscape(po.SupplierName), services.FormatItemLines(itemLines, 12), services.FormatMoney(total, a.mainCurrency(companyOf(c))),
 		))
 	}
 	utils.OK(c, http.StatusOK, out[0])
