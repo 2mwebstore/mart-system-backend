@@ -16,6 +16,7 @@ var PermissionDefs = []Permission{
 	{Key: "pos.edit_sale", Group: "pos", Description: "Edit a sale's items (still-open shift only)"},
 	{Key: "pos.refund", Group: "pos", Description: "Refund a sale"},
 	{Key: "pos.open_drawer", Group: "pos", Description: "Open the cash drawer without a sale"},
+	{Key: "pos.cash_movement", Group: "pos", Description: "Record cash pay-ins and pay-outs"},
 	{Key: "shift.own", Group: "shift", Description: "Open/close own shift"},
 	{Key: "shift.close_others", Group: "shift", Description: "Close another cashier's shift"},
 	{Key: "shift.see_expected", Group: "shift", Description: "See expected cash before counting"},
@@ -112,7 +113,7 @@ func crud(record string) []string {
 }
 
 var (
-	posAll   = []string{"pos.sell", "pos.discount", "pos.void", "pos.edit_sale", "pos.refund", "pos.open_drawer"}
+	posAll   = []string{"pos.sell", "pos.discount", "pos.void", "pos.edit_sale", "pos.refund", "pos.open_drawer", "pos.cash_movement"}
 	shiftAll = []string{"shift.own", "shift.close_others", "shift.see_expected"}
 	// Running the stock: the catalog, counts and transfers, purchase orders.
 	inventoryOps = joinKeys(
@@ -138,7 +139,7 @@ var DefaultRoles = []RoleTemplate{
 	{
 		Name: "Cashier", Description: "Sells at the till and runs own shift.",
 		Permissions: []string{
-			"pos.sell", "shift.own", "product.view", "category.view", "inventory.view",
+			"pos.sell", "pos.cash_movement", "shift.own", "product.view", "category.view", "inventory.view",
 			"customer.view", "customer.create", "customer.update",
 		},
 		MaxDiscountPercent: 5, RefundWithoutApprovalCents: 500,

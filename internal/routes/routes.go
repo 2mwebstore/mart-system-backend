@@ -206,7 +206,8 @@ func Setup(deps Dependencies) *gin.Engine {
 		// Shifts & sales
 		authed.GET("/shifts/current", perm("shift.own"), api.GetCurrentShift)
 		authed.POST("/shifts/open", perm("shift.own"), api.OpenShift)
-		authed.POST("/shifts/:id/cash-movements", perm("shift.own"), api.AddCashMovement)
+		// A pay-in or pay-out: on your own shift, and only with its own permission.
+		authed.POST("/shifts/:id/cash-movements", perm("shift.own"), perm("pos.cash_movement"), api.AddCashMovement)
 		authed.POST("/shifts/:id/close", perm("shift.own"), api.CloseShift)
 		authed.GET("/shifts", anyPerm("shift.own", "report.sales"), api.ListShifts)
 

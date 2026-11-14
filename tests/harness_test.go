@@ -39,7 +39,7 @@ const (
 )
 
 var allPermissions = []string{
-	"pos.sell", "pos.discount", "pos.void", "pos.edit_sale", "pos.refund", "pos.open_drawer",
+	"pos.sell", "pos.discount", "pos.void", "pos.edit_sale", "pos.refund", "pos.open_drawer", "pos.cash_movement",
 	"shift.own", "shift.close_others", "shift.see_expected",
 	"product.view", "product.create", "product.update", "product.delete",
 	"category.view", "category.create", "category.update", "category.delete",
@@ -60,7 +60,7 @@ var allPermissions = []string{
 }
 
 var managerPermissions = []string{
-	"pos.sell", "pos.discount", "pos.void", "pos.edit_sale", "pos.refund", "pos.open_drawer",
+	"pos.sell", "pos.discount", "pos.void", "pos.edit_sale", "pos.refund", "pos.open_drawer", "pos.cash_movement",
 	"shift.own", "shift.close_others", "shift.see_expected",
 	"product.view", "product.create", "product.update", "product.delete",
 	"category.view", "category.create", "category.update", "category.delete",
@@ -74,7 +74,7 @@ var managerPermissions = []string{
 }
 
 var cashierPermissions = []string{
-	"pos.sell", "shift.own", "product.view", "category.view", "inventory.view",
+	"pos.sell", "pos.cash_movement", "shift.own", "product.view", "category.view", "inventory.view",
 	"customer.view", "customer.create", "customer.update",
 }
 

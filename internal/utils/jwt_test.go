@@ -106,11 +106,11 @@ func TestParseAccessTokenRejects(t *testing.T) {
 
 func TestPOSScopePermissions(t *testing.T) {
 	got := POSScopePermissions([]string{
-		"pos.sell", "pos.void", "shift.own", "product.view", "category.view", "inventory.view", "customer.view", "customer.create",
+		"pos.sell", "pos.void", "pos.cash_movement", "shift.own", "product.view", "category.view", "inventory.view", "customer.view", "customer.create",
 		"product.create", "supplier.view", "inventory.adjust", "report.sales", "user.create", "role.update", "system.reset",
 		"system.manage", "branch.view", "posing.as.pos",
 	})
-	want := []string{"pos.sell", "pos.void", "shift.own", "product.view", "category.view", "inventory.view", "customer.view", "customer.create"}
+	want := []string{"pos.sell", "pos.void", "pos.cash_movement", "shift.own", "product.view", "category.view", "inventory.view", "customer.view", "customer.create"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("got %v, want %v", got, want)
 	}
