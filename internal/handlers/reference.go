@@ -456,6 +456,11 @@ type settingsDTO struct {
 	// admin app shows nothing about shifts). Only read here; the super admin
 	// sets it on the company (POST/PUT /platform/companies).
 	ShiftMode string `json:"shift_mode"`
+	// UsesTables is whether the company uses tables: dining tables, their QR
+	// codes and the orders customers send from them. Off, the admin app shows
+	// nothing about tables and the table routes are refused. Only read here;
+	// the super admin sets it on the company (see tables_switch.go).
+	UsesTables bool `json:"uses_tables"`
 }
 
 const (
@@ -534,6 +539,7 @@ func (a *API) loadSettings(companyID uint64) settingsDTO {
 		TaxDefaults:         a.taxDefaults(companyID, m),
 		MainCurrency:        string(mainCurrencyOf(m[settingMainCurrency])),
 		ShiftMode:           shiftModeOf(m[settingShiftMode]),
+		UsesTables:          tablesOn(m[settingTables]),
 	}
 	// Only while that customer is still the company's: one deleted since (or
 	// wiped by a production reset) leaves the POS on walk-in.

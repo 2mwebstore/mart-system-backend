@@ -79,10 +79,12 @@ type companyDTO struct {
 	ShiftMode string `json:"shift_mode" gorm:"-"`
 	// MainCurrency is what it prices and sells in: USD or KHR (see
 	// currency.go). Locked once it has amounts stored in it.
-	MainCurrency       string            `json:"main_currency" gorm:"-"`
-	MainCurrencyLocked bool              `json:"main_currency_locked" gorm:"-"`
-	Owners             []companyOwnerDTO `json:"owners" gorm:"-"`
-	CreatedAt          time.Time         `json:"created_at"`
+	MainCurrency       string `json:"main_currency" gorm:"-"`
+	MainCurrencyLocked bool   `json:"main_currency_locked" gorm:"-"`
+	// UsesTables is whether it uses tables and QR ordering (tables_switch.go).
+	UsesTables bool              `json:"uses_tables" gorm:"-"`
+	Owners     []companyOwnerDTO `json:"owners" gorm:"-"`
+	CreatedAt  time.Time         `json:"created_at"`
 }
 
 // loadCompanies is every company, or just onlyID, with how many branches and
@@ -123,18 +125,21 @@ func (a *API) loadCompanies(onlyID uint64) ([]companyDTO, error) {
 		byCompany[o.CompanyID] = append(byCompany[o.CompanyID], companyOwnerDTO{ID: o.ID, FullName: o.FullName, Username: o.Username, Active: o.Active})
 	}
 	var modes []models.CompanySetting
-	mq := a.DB.Where("`key` IN ?", []string{settingShiftMode, settingMainCurrency})
+	mq := a.DB.Where("`key` IN ?", []string{settingShiftMode, settingMainCurrency, settingTables})
 	if onlyID != 0 {
 		mq = mq.Where("company_id = ?", onlyID)
 	}
 	if err := mq.Find(&modes).Error; err != nil {
 		return nil, err
 	}
-	modeOf, currencyOf := map[uint64]string{}, map[uint64]string{}
+	modeOf, currencyOf, tablesOf := map[uint64]string{}, map[uint64]string{}, map[uint64]string{}
 	for _, m := range modes {
-		if m.Key == settingMainCurrency {
+		switch m.Key {
+		case settingMainCurrency:
 			currencyOf[m.CompanyID] = m.Value
-		} else {
+		case settingTables:
+			tablesOf[m.CompanyID] = m.Value
+		default:
 			modeOf[m.CompanyID] = m.Value
 		}
 	}
@@ -151,6 +156,7 @@ func (a *API) loadCompanies(onlyID uint64) ([]companyDTO, error) {
 		companies[i].ShiftMode = shiftModeOf(modeOf[companies[i].ID])
 		companies[i].MainCurrency = string(mainCurrencyOf(currencyOf[companies[i].ID]))
 		companies[i].MainCurrencyLocked = locked[companies[i].ID]
+		companies[i].UsesTables = tablesOn(tablesOf[companies[i].ID])
 		companies[i].Owners = byCompany[companies[i].ID]
 		if companies[i].Owners == nil {
 			companies[i].Owners = []companyOwnerDTO{}
@@ -167,6 +173,25 @@ func (a *API) ListCompanies(c *gin.Context) {
 		return
 	}
 	utils.OK(c, http.StatusOK, companies)
+}
+
+// GetCompany is one company, as ListCompanies lists it: what the Edit
+// company page opens with.
+func (a *API) GetCompany(c *gin.Context) {
+	id, ok := idParam(c)
+	if !ok {
+		return
+	}
+	companies, err := a.loadCompanies(id)
+	if err != nil {
+		dbFail(c, err)
+		return
+	}
+	if len(companies) == 0 {
+		fail(c, utils.ErrNotFound)
+		return
+	}
+	utils.OK(c, http.StatusOK, companies[0])
 }
 
 // companyCode reads a company code as it's stored: upper case. It answers
@@ -213,11 +238,13 @@ type createCompanyReq struct {
 	ShiftMode string `json:"shift_mode" binding:"omitempty,oneof=REQUIRED SKIP"`
 	// What it prices and sells in; USD when left out.
 	MainCurrency string `json:"main_currency" binding:"omitempty,oneof=USD KHR"`
+	// Whether it uses tables and QR ordering; on when left out.
+	UsesTables *bool `json:"uses_tables"`
 }
 
 // CreateCompany makes a company ready to use: its default roles, numbering
-// and payment methods, how its tills start selling, its main currency, and
-// its first Owner, who signs in and sets up the branches, tills, staff and
+// and payment methods, how its tills start selling, its main currency,
+// whether it uses tables, and its first Owner, who signs in and sets up the branches, tills, staff and
 // catalog.
 func (a *API) CreateCompany(c *gin.Context) {
 	var req createCompanyReq
@@ -241,6 +268,7 @@ func (a *API) CreateCompany(c *gin.Context) {
 		return
 	}
 	company := models.Company{Name: strings.TrimSpace(req.Name), Code: code, Active: true, MaxBranches: req.MaxBranches, MaxUsers: req.MaxUsers}
+	usesTables := req.UsesTables == nil || *req.UsesTables
 	usernameTaken := false
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&company).Error; err != nil {
@@ -251,7 +279,9 @@ func (a *API) CreateCompany(c *gin.Context) {
 			return err
 		}
 		currency := mainCurrencyOf(req.MainCurrency)
-		if err := saveCompanySettings(tx, company.ID, map[string]string{settingShiftMode: shiftModeOf(req.ShiftMode), settingMainCurrency: string(currency)}); err != nil {
+		if err := saveCompanySettings(tx, company.ID, map[string]string{
+			settingShiftMode: shiftModeOf(req.ShiftMode), settingMainCurrency: string(currency), settingTables: tablesSetting(usesTables),
+		}); err != nil {
 			return err
 		}
 		// The default roles' refund limits are dollar amounts.
@@ -278,7 +308,7 @@ func (a *API) CreateCompany(c *gin.Context) {
 	}
 	a.auditIn(c, company.ID, "platform", "company.create", "company", company.ID, nil, gin.H{
 		"name": company.Name, "code": company.Code, "owner": req.OwnerUsername, "max_branches": req.MaxBranches, "max_users": req.MaxUsers,
-		"shift_mode": shiftModeOf(req.ShiftMode), "main_currency": mainCurrencyOf(req.MainCurrency),
+		"shift_mode": shiftModeOf(req.ShiftMode), "main_currency": mainCurrencyOf(req.MainCurrency), "uses_tables": usesTables,
 	})
 	out, err := a.loadCompanies(company.ID)
 	if err != nil || len(out) == 0 {
@@ -303,12 +333,15 @@ type updateCompanyReq struct {
 	// What it prices and sells in; left out keeps it. It can only change
 	// while the company has no amounts stored (MAIN_CURRENCY_LOCKED).
 	MainCurrency string `json:"main_currency" binding:"omitempty,oneof=USD KHR"`
+	// Whether it uses tables and QR ordering; left out keeps it. It can't be
+	// turned off while a table has orders open (TABLE_ORDERS_OPEN).
+	UsesTables *bool `json:"uses_tables"`
 }
 
 // UpdateCompany renames a company, changes its code, turns it on or off,
 // sets its limits, how long it keeps its activity log, whether it works in
-// shifts and its main currency. Every field is the new value (a shift mode or
-// currency left out is kept). Turning it off signs every one of its users
+// shifts, its main currency and whether it uses tables. Every field is the
+// new value (a shift mode, currency or tables switch left out is kept). Turning it off signs every one of its users
 // out and keeps them out: their next request is refused and they can't sign
 // in.
 func (a *API) UpdateCompany(c *gin.Context) {
@@ -343,6 +376,11 @@ func (a *API) UpdateCompany(c *gin.Context) {
 	if req.MainCurrency != "" {
 		currencyAfter = mainCurrencyOf(req.MainCurrency)
 	}
+	tablesBefore := a.usesTables(id)
+	tablesAfter := tablesBefore
+	if req.UsesTables != nil {
+		tablesAfter = *req.UsesTables
+	}
 	err := a.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&models.Company{}).Where("id = ?", id).Updates(map[string]interface{}{
 			"name": strings.TrimSpace(req.Name), "code": code, "active": req.Active,
@@ -372,13 +410,26 @@ func (a *API) UpdateCompany(c *gin.Context) {
 				return err
 			}
 		}
+		if tablesAfter != tablesBefore {
+			if !tablesAfter {
+				// Checked in the transaction, like the currency above.
+				if open, err := hasOpenTableOrders(tx, id); err != nil {
+					return err
+				} else if open {
+					return errTableOrdersOpen
+				}
+			}
+			if err := saveCompanySettings(tx, id, map[string]string{settingTables: tablesSetting(tablesAfter)}); err != nil {
+				return err
+			}
+		}
 		if before.Active && !req.Active {
 			return endCompanySessions(tx, id)
 		}
 		return nil
 	})
-	if errors.Is(err, errMainCurrencyLocked) {
-		fail(c, errMainCurrencyLocked)
+	if errors.Is(err, errMainCurrencyLocked) || errors.Is(err, errTableOrdersOpen) {
+		fail(c, err)
 		return
 	}
 	if err != nil {
@@ -393,7 +444,7 @@ func (a *API) UpdateCompany(c *gin.Context) {
 	a.auditIn(c, id, "platform", "company.update", "company", id, gin.H{
 		"name": before.Name, "code": before.Code, "active": before.Active,
 		"max_branches": before.MaxBranches, "max_users": before.MaxUsers, "retention_months": retentionBefore,
-		"shift_mode": shiftModeBefore, "main_currency": currencyBefore,
+		"shift_mode": shiftModeBefore, "main_currency": currencyBefore, "uses_tables": tablesBefore,
 	}, req)
 	utils.OK(c, http.StatusOK, out[0])
 }

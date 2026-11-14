@@ -114,11 +114,15 @@ func Setup(deps Dependencies) *gin.Engine {
 		authed.PUT("/devices/:id", perm("branch.update"), api.UpdateDevice)
 		authed.DELETE("/devices/:id", perm("branch.delete"), api.DeleteDevice)
 
-		authed.GET("/dining-tables", perm("table.view"), api.ListDiningTables)
-		authed.POST("/dining-tables", perm("table.create"), api.CreateDiningTable)
-		authed.POST("/dining-tables/bulk", perm("table.create"), api.CreateDiningTablesBulk)
-		authed.PUT("/dining-tables/:id", perm("table.update"), api.UpdateDiningTable)
-		authed.DELETE("/dining-tables/:id", perm("table.delete"), api.DeleteDiningTable)
+		// Tables and their orders: only for a company that uses tables (the
+		// super admin's switch, see handlers/tables_switch.go). Checked after
+		// the permission, which needs no database.
+		withTables := api.RequireTables
+		authed.GET("/dining-tables", perm("table.view"), withTables, api.ListDiningTables)
+		authed.POST("/dining-tables", perm("table.create"), withTables, api.CreateDiningTable)
+		authed.POST("/dining-tables/bulk", perm("table.create"), withTables, api.CreateDiningTablesBulk)
+		authed.PUT("/dining-tables/:id", perm("table.update"), withTables, api.UpdateDiningTable)
+		authed.DELETE("/dining-tables/:id", perm("table.delete"), withTables, api.DeleteDiningTable)
 
 		authed.GET("/payment-methods", api.ListPaymentMethods)
 		authed.POST("/payment-methods", perm("payment_method.create"), api.CreatePaymentMethod)
@@ -226,11 +230,11 @@ func Setup(deps Dependencies) *gin.Engine {
 		authed.POST("/invoices/:id/cancel", perm("invoice.delete"), api.CancelInvoice)
 		authed.DELETE("/invoices/:id/payments/:paymentId", perm("invoice.delete"), api.DeleteInvoicePayment)
 
-		authed.GET("/table-orders", anyPerm("pos.sell", "report.sales"), api.ListTableOrders)
-		authed.GET("/table-board", anyPerm("pos.sell", "report.sales"), api.ListTableBoard)
-		authed.POST("/table-orders/:id/accept", perm("pos.sell"), api.AcceptTableOrder)
-		authed.POST("/table-orders/:id/cancel", perm("pos.sell"), api.CancelTableOrder)
-		authed.POST("/table-orders/move", perm("pos.sell"), api.MoveTableOrders)
+		authed.GET("/table-orders", anyPerm("pos.sell", "report.sales"), withTables, api.ListTableOrders)
+		authed.GET("/table-board", anyPerm("pos.sell", "report.sales"), withTables, api.ListTableBoard)
+		authed.POST("/table-orders/:id/accept", perm("pos.sell"), withTables, api.AcceptTableOrder)
+		authed.POST("/table-orders/:id/cancel", perm("pos.sell"), withTables, api.CancelTableOrder)
+		authed.POST("/table-orders/move", perm("pos.sell"), withTables, api.MoveTableOrders)
 
 		// Reports
 		rep := authed.Group("/reports")
@@ -256,6 +260,7 @@ func Setup(deps Dependencies) *gin.Engine {
 	{
 		platform.GET("/companies", api.ListCompanies)
 		platform.POST("/companies", api.CreateCompany)
+		platform.GET("/companies/:id", api.GetCompany)
 		platform.PUT("/companies/:id", api.UpdateCompany)
 		platform.POST("/companies/:id/owner", api.SetCompanyOwner)
 		platform.POST("/companies/:id/activity-log/clear", api.ClearCompanyActivityLog)

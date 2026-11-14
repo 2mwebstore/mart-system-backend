@@ -277,6 +277,10 @@ func (a *API) activeTableByToken(token string) (*models.DiningTable, *models.Bra
 	if err := a.DB.Where("id = ? AND active = 1 AND company_id IN (SELECT id FROM companies WHERE active = 1 AND deleted_at IS NULL)", t.BranchID).First(&b).Error; err != nil {
 		return nil, nil, err
 	}
+	// A company with tables turned off has no table to order at.
+	if !a.usesTables(b.CompanyID) {
+		return nil, nil, gorm.ErrRecordNotFound
+	}
 	return &t, &b, nil
 }
 
